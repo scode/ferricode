@@ -16,8 +16,8 @@ Sign in with OpenAI Codex auth:
 cargo run -p ferric -- auth openai-codex
 ```
 
-The command starts a short-lived callback listener on `127.0.0.1:1455`, opens the browser, and also prints the auth URL
-so you can open it manually.
+The command starts a short-lived callback listener on `127.0.0.1:1455`, tries to open the browser, and also prints the
+auth URL so you can open it manually.
 
 After auth succeeds, send a prompt through the OpenAI Codex provider:
 

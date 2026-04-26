@@ -38,7 +38,7 @@ response out. Do not add registries, model selection, public streaming APIs, too
 fallback until the harness actually needs them.
 
 The first provider is `ferricode-openai-codex`. Its public provider name is `openai-codex`. It uses Codex-compatible
-ChatGPT OAuth, not the OpenAI Platform API key path. For now it hardcodes `gpt-5.5` and medium reasoning effort.
+ChatGPT OAuth, not the OpenAI Platform API key path. For now it hardcodes `gpt-5.4` and medium reasoning effort.
 
 # Authentication
 
@@ -56,7 +56,9 @@ The authorization request must include PKCE (`code_challenge_method=S256`), a ge
 `codex_cli_simplified_flow=true`, and `originator=codex_cli_rs`. The token exchange and token refresh requests use
 `client_id` with the authorization code verifier or refresh token. They must not send a client secret.
 
-Successful auth stores returned tokens and account metadata in `~/.ferric/auth.toml` under `openai_codex`.
+Successful auth stores returned tokens and account metadata in `~/.ferric/auth.toml` under `openai_codex`. Auth file
+writes require Unix-style private file permissions for now; platforms where the crate cannot create private token files
+must fail rather than store long-lived credentials with ambient default permissions.
 
 # Dependency Rules
 
