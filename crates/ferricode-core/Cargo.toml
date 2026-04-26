@@ -5,4 +5,5 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[dependencies]
+[dev-dependencies]
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }

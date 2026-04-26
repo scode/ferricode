@@ -2,6 +2,7 @@
 members = [
   "crates/ferric",
   "crates/ferricode-core",
+  "crates/ferricode-openai-codex",
   "crates/ferricode-tui",
 ]
 resolver = "3"
