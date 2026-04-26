@@ -1,0 +1,9 @@
+[package]
+name = "ferricode-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferricode-core = { version = "0.1.0", path = "../ferricode-core" }
