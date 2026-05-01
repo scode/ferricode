@@ -5,16 +5,19 @@
 //! stores Codex OAuth token state and account metadata.
 
 use base64::Engine;
-use ferricode_core::{ModelProvider, ProviderError, ProviderRequest};
+use ferricode_core::{
+    ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolCall, ToolOutput,
+};
 use rand::RngCore;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::str;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,10 +38,13 @@ const CODEX_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const MODEL: &str = "gpt-5.4";
 const REASONING_EFFORT: &str = "medium";
-const INSTRUCTIONS: &str =
-    "You are Ferricode, a coding harness. Respond directly to the user's request.";
+const INSTRUCTIONS: &str = "You are Ferricode, a coding harness. Use the built-in filesystem tools when the user's request requires repository context. Start with a directory listing when you need to understand the working directory, then read specific relevant text files. Do not ask for clarification when the request can be handled by inspecting files.";
 const REFRESH_SKEW: Duration = Duration::from_secs(60);
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_STREAMING_OUTPUT_INDEX: usize = 1024;
+const MAX_FUNCTION_CALL_ID_BYTES: usize = 256;
+const MAX_FUNCTION_CALL_NAME_BYTES: usize = 256;
+const MAX_FUNCTION_CALL_ARGUMENT_BYTES: usize = 16 * 1024;
 
 /// Errors produced by the OpenAI Codex provider and auth flow.
 #[derive(Debug, Error)]
@@ -321,6 +327,20 @@ impl OpenAiCodexProvider {
         }
     }
 
+    /// Runs one provider interaction and expects final assistant text.
+    ///
+    /// This helper is for tests and simple callers that deliberately bypass the
+    /// core harness. Production requests should go through `ferricode-core` so
+    /// built-in tool calls can be executed.
+    pub async fn respond(&self, request: &ProviderRequest) -> Result<String, ProviderError> {
+        match self.start(request).await? {
+            ProviderTurn::Final(text) => Ok(text),
+            ProviderTurn::ToolCalls { .. } => Err(ProviderError::new(
+                "model requested built-in tools outside the core harness",
+            )),
+        }
+    }
+
     async fn authenticated_tokens(&self) -> Result<TokenSet, OpenAiCodexError> {
         let mut tokens = read_auth_file(&self.auth_path)?
             .openai_codex
@@ -356,26 +376,67 @@ impl OpenAiCodexProvider {
 }
 
 impl ModelProvider for OpenAiCodexProvider {
-    async fn respond<'a>(&'a self, request: &'a ProviderRequest) -> Result<String, ProviderError> {
+    type State = OpenAiCodexState;
+
+    async fn start<'a>(
+        &'a self,
+        request: &'a ProviderRequest,
+    ) -> Result<ProviderTurn<Self::State>, ProviderError> {
         let tokens = self.authenticated_tokens().await?;
         let body = build_responses_body(request);
+        let input_items = response_input_items(&body);
+        let turn = self
+            .send_responses_request(&tokens, &body)
+            .await
+            .map_err(ProviderError::from)?;
+        Ok(attach_input_items(turn, input_items))
+    }
+
+    async fn resume<'a>(
+        &'a self,
+        state: Self::State,
+        tool_outputs: &'a [ToolOutput],
+    ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+        let tokens = self.authenticated_tokens().await?;
+        let body = build_tool_outputs_body(state, tool_outputs);
+        let input_items = response_input_items(&body);
+        let turn = self
+            .send_responses_request(&tokens, &body)
+            .await
+            .map_err(ProviderError::from)?;
+        Ok(attach_input_items(turn, input_items))
+    }
+}
+
+impl OpenAiCodexProvider {
+    async fn send_responses_request(
+        &self,
+        tokens: &TokenSet,
+        body: &Value,
+    ) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
         let response = self
             .client
             .post(&self.backend_url)
-            .headers(build_codex_headers(&tokens)?)
+            .headers(build_codex_headers(tokens)?)
             .json(&body)
             .send()
-            .await
-            .map_err(OpenAiCodexError::from)?;
+            .await?;
 
         let status = response.status();
-        let text = response.text().await.map_err(OpenAiCodexError::from)?;
         if !status.is_success() {
-            return Err(OpenAiCodexError::BackendStatus { status, body: text }.into());
+            let text = response.text().await?;
+            return Err(OpenAiCodexError::BackendStatus { status, body: text });
         }
 
-        parse_assistant_text(&text).map_err(ProviderError::from)
+        read_assistant_response(response).await
     }
+}
+
+/// OpenAI response output items needed to resume after tool execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenAiCodexState {
+    input_items: Vec<Value>,
+    output_items: Vec<Value>,
 }
 
 /// Builds the hardcoded bootstrap Responses body.
@@ -395,7 +456,7 @@ pub fn build_responses_body(request: &ProviderRequest) -> Value {
                 ]
             }
         ],
-        "tools": [],
+        "tools": built_in_tool_schemas(),
         "tool_choice": "auto",
         "parallel_tool_calls": false,
         "reasoning": {
@@ -405,17 +466,130 @@ pub fn build_responses_body(request: &ProviderRequest) -> Value {
     })
 }
 
+fn build_tool_outputs_body(state: OpenAiCodexState, tool_outputs: &[ToolOutput]) -> Value {
+    let mut input = state.input_items;
+    input.extend(state.output_items.into_iter().map(strip_provider_item_ids));
+    input.extend(tool_outputs.iter().map(|output| {
+        json!({
+            "type": "function_call_output",
+            "call_id": output.call_id(),
+            "output": output.output(),
+        })
+    }));
+
+    json!({
+        "model": MODEL,
+        "instructions": INSTRUCTIONS,
+        "stream": true,
+        "input": input,
+        "tools": built_in_tool_schemas(),
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": {
+            "effort": REASONING_EFFORT
+        },
+        "store": false
+    })
+}
+
+fn response_input_items(body: &Value) -> Vec<Value> {
+    body.get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn attach_input_items(
+    turn: ProviderTurn<OpenAiCodexState>,
+    input_items: Vec<Value>,
+) -> ProviderTurn<OpenAiCodexState> {
+    match turn {
+        ProviderTurn::ToolCalls { mut state, calls } => {
+            state.input_items = input_items;
+            ProviderTurn::ToolCalls { state, calls }
+        }
+        ProviderTurn::Final(text) => ProviderTurn::Final(text),
+    }
+}
+
+fn strip_provider_item_ids(mut item: Value) -> Value {
+    if let Some(map) = item.as_object_mut() {
+        map.remove("id");
+    }
+    item
+}
+
+fn built_in_tool_schemas() -> Value {
+    json!([
+        {
+            "type": "function",
+            "name": "ferricode_list_directory",
+            "description": "List one directory under the request working directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "A relative path under the request working directory."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            },
+            "strict": true
+        },
+        {
+            "type": "function",
+            "name": "ferricode_read_file",
+            "description": "Read one UTF-8 text file under the request working directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "A relative path under the request working directory."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }
+    ])
+}
+
 /// Parses either JSON or minimal SSE `data:` events into assistant text.
 pub fn parse_assistant_text(text: &str) -> Result<String, OpenAiCodexError> {
+    match parse_assistant_turn(text)? {
+        ProviderTurn::Final(text) => Ok(text),
+        ProviderTurn::ToolCalls { .. } => Err(OpenAiCodexError::MissingAssistantText),
+    }
+}
+
+fn parse_assistant_turn(text: &str) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
     let trimmed = text.trim();
     if trimmed.lines().any(|line| line.starts_with("data:")) {
         return parse_sse_assistant_text(trimmed);
     }
 
     let value: Value = serde_json::from_str(trimmed)?;
-    extract_text_from_response(&value)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(OpenAiCodexError::MissingAssistantText)
+    parse_response_turn(&value)
+}
+
+async fn read_assistant_response(
+    mut response: reqwest::Response,
+) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+    if !response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+    {
+        let text = response.text().await?;
+        return parse_assistant_turn(&text);
+    }
+
+    parse_sse_assistant_stream(&mut response).await
 }
 
 /// Builds the Codex-compatible browser authorization URL.
@@ -635,22 +809,193 @@ async fn post_token_form(
     Ok(serde_json::from_str(&text)?)
 }
 
-fn parse_sse_assistant_text(text: &str) -> Result<String, OpenAiCodexError> {
-    let mut joined = String::new();
+fn parse_sse_assistant_text(
+    text: &str,
+) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+    let mut accumulator = SseAccumulator::default();
     for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data == "[DONE]" || data.is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str::<Value>(data)?;
-        if let Some(text) = extract_text_from_event(&value) {
-            joined.push_str(&text);
+        if accumulator.process_line(line.as_bytes())? == SseDataAction::Complete {
+            break;
         }
     }
 
+    accumulator.into_provider_turn()
+}
+
+async fn parse_sse_assistant_stream(
+    response: &mut reqwest::Response,
+) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+    let mut pending = Vec::new();
+    let mut accumulator = SseAccumulator::default();
+
+    while let Some(chunk) = response.chunk().await? {
+        pending.extend_from_slice(&chunk);
+        while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=line_end).collect::<Vec<_>>();
+            if accumulator.process_line(&line)? == SseDataAction::Complete {
+                return accumulator.into_provider_turn();
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        accumulator.process_line(&pending)?;
+    }
+    accumulator.into_provider_turn()
+}
+
+fn parse_response_turn(value: &Value) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+    let output_items = value
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let calls = collect_function_calls(output_items.iter())?;
+    if !calls.is_empty() {
+        return Ok(ProviderTurn::ToolCalls {
+            state: OpenAiCodexState {
+                input_items: Vec::new(),
+                output_items,
+            },
+            calls,
+        });
+    }
+
+    let text = extract_text_from_response(value)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(OpenAiCodexError::MissingAssistantText)?;
+    Ok(ProviderTurn::Final(text))
+}
+
+#[derive(Default)]
+struct SseAccumulator {
+    text: String,
+    output_items: Vec<Value>,
+    function_calls: BTreeMap<usize, StreamingFunctionCall>,
+}
+
+impl SseAccumulator {
+    fn process_line(&mut self, line: &[u8]) -> Result<SseDataAction, OpenAiCodexError> {
+        let line = parse_sse_line(line)?;
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(SseDataAction::Continue);
+        };
+        self.process_data_line(data)
+    }
+
+    fn process_data_line(&mut self, data: &str) -> Result<SseDataAction, OpenAiCodexError> {
+        let data = data.trim();
+        if data.is_empty() {
+            return Ok(SseDataAction::Continue);
+        }
+        if data == "[DONE]" {
+            return Ok(SseDataAction::Complete);
+        }
+
+        let value = serde_json::from_str::<Value>(data)?;
+        if let Some(text) = extract_text_from_event(&value) {
+            self.text.push_str(&text);
+        }
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_item.added") => {
+                let index = required_event_output_index(&value)?;
+                let item = required_event_value(&value, "item")?;
+                if is_function_call_item(item) {
+                    self.function_calls
+                        .entry(index)
+                        .or_default()
+                        .merge_item(item)?;
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                let index = required_event_output_index(&value)?;
+                let delta = required_event_string(&value, "delta")?;
+                let call = self.function_calls.entry(index).or_default();
+                if call.arguments.len() + delta.len() > MAX_FUNCTION_CALL_ARGUMENT_BYTES {
+                    return Err(OpenAiCodexError::Protocol(format!(
+                        "streamed function call arguments exceeded the limit of {MAX_FUNCTION_CALL_ARGUMENT_BYTES} bytes"
+                    )));
+                }
+                call.arguments.push_str(delta);
+            }
+            Some("response.function_call_arguments.done") => {
+                let index = required_event_output_index(&value)?;
+                let arguments = required_event_string(&value, "arguments")?;
+                validate_function_call_field("arguments", arguments)?;
+                self.function_calls.entry(index).or_default().arguments = arguments.to_string();
+            }
+            Some("response.output_item.done") => {
+                let item = required_event_value(&value, "item")?;
+                if is_function_call_item(item) {
+                    let index = required_event_output_index(&value)?;
+                    self.function_calls
+                        .entry(index)
+                        .or_default()
+                        .merge_item(item)?;
+                }
+                self.output_items.push(item.clone());
+            }
+            Some("response.completed") => return Ok(SseDataAction::Complete),
+            Some("response.failed" | "response.incomplete") => {
+                return Err(OpenAiCodexError::Protocol(
+                    "OpenAI Codex backend ended the response without completing it".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(SseDataAction::Continue)
+    }
+
+    fn into_provider_turn(mut self) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+        if !self.function_calls.is_empty() {
+            self.merge_streaming_function_items()?;
+            let calls = collect_streaming_function_calls(&self.function_calls);
+            return Ok(ProviderTurn::ToolCalls {
+                state: OpenAiCodexState {
+                    input_items: Vec::new(),
+                    output_items: self.output_items,
+                },
+                calls,
+            });
+        }
+
+        completed_sse_text(self.text).map(ProviderTurn::Final)
+    }
+
+    fn merge_streaming_function_items(&mut self) -> Result<(), OpenAiCodexError> {
+        for (index, call) in &self.function_calls {
+            if *index >= MAX_STREAMING_OUTPUT_INDEX {
+                return Err(OpenAiCodexError::Protocol(format!(
+                    "streamed function call output_index {index} exceeded the limit of {MAX_STREAMING_OUTPUT_INDEX}"
+                )));
+            }
+            let item = call.to_item()?;
+            if self.output_items.len() <= *index {
+                self.output_items.resize(*index + 1, Value::Null);
+            }
+            self.output_items[*index] = item;
+        }
+        self.output_items.retain(|item| !item.is_null());
+        Ok(())
+    }
+}
+
+fn parse_sse_line(line: &[u8]) -> Result<&str, OpenAiCodexError> {
+    let line = str::from_utf8(line)
+        .map_err(|_| OpenAiCodexError::Protocol("SSE response was not valid UTF-8".to_string()))?
+        .trim_end_matches(['\r', '\n']);
+    Ok(line)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseDataAction {
+    Continue,
+    Complete,
+}
+
+fn completed_sse_text(joined: String) -> Result<String, OpenAiCodexError> {
     if joined.trim().is_empty() {
         Err(OpenAiCodexError::MissingAssistantText)
     } else {
@@ -699,6 +1044,156 @@ fn extract_text_from_event(value: &Value) -> Option<String> {
         return Some(text.clone());
     }
     None
+}
+
+fn collect_function_calls<'a>(
+    items: impl Iterator<Item = &'a Value>,
+) -> Result<Vec<ToolCall>, OpenAiCodexError> {
+    items
+        .filter_map(function_call_from_item)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn function_call_from_item(item: &Value) -> Option<Result<ToolCall, OpenAiCodexError>> {
+    if !is_function_call_item(item) {
+        return None;
+    }
+    Some((|| {
+        Ok(ToolCall::new(
+            required_function_call_string(item, "call_id")?,
+            required_function_call_string(item, "name")?,
+            required_function_call_string(item, "arguments")?,
+        ))
+    })())
+}
+
+fn required_function_call_string<'a>(
+    item: &'a Value,
+    field: &str,
+) -> Result<&'a str, OpenAiCodexError> {
+    let value = item.get(field).and_then(Value::as_str).ok_or_else(|| {
+        OpenAiCodexError::Protocol(format!(
+            "function_call item did not include string `{field}`"
+        ))
+    })?;
+    validate_function_call_field(field, value)?;
+    Ok(value)
+}
+
+fn validate_function_call_field(field: &str, value: &str) -> Result<(), OpenAiCodexError> {
+    let Some(limit) = function_call_field_limit(field) else {
+        return Ok(());
+    };
+    if value.len() > limit {
+        return Err(OpenAiCodexError::Protocol(format!(
+            "function_call `{field}` exceeded the limit of {limit} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn function_call_field_limit(field: &str) -> Option<usize> {
+    match field {
+        "call_id" => Some(MAX_FUNCTION_CALL_ID_BYTES),
+        "name" => Some(MAX_FUNCTION_CALL_NAME_BYTES),
+        "arguments" => Some(MAX_FUNCTION_CALL_ARGUMENT_BYTES),
+        _ => None,
+    }
+}
+
+fn is_function_call_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call")
+    )
+}
+
+fn event_output_index(value: &Value) -> Option<usize> {
+    value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| value.try_into().ok())
+}
+
+fn required_event_output_index(value: &Value) -> Result<usize, OpenAiCodexError> {
+    event_output_index(value).ok_or_else(|| {
+        OpenAiCodexError::Protocol(
+            "function call stream event did not include integer `output_index`".to_string(),
+        )
+    })
+}
+
+fn required_event_value<'a>(value: &'a Value, field: &str) -> Result<&'a Value, OpenAiCodexError> {
+    value.get(field).ok_or_else(|| {
+        OpenAiCodexError::Protocol(format!(
+            "function call stream event did not include `{field}`"
+        ))
+    })
+}
+
+fn required_event_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, OpenAiCodexError> {
+    value.get(field).and_then(Value::as_str).ok_or_else(|| {
+        OpenAiCodexError::Protocol(format!(
+            "function call stream event did not include string `{field}`"
+        ))
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamingFunctionCall {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl StreamingFunctionCall {
+    fn merge_item(&mut self, item: &Value) -> Result<(), OpenAiCodexError> {
+        if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+            validate_function_call_field("call_id", call_id)?;
+            self.call_id = Some(call_id.to_string());
+        }
+        if let Some(name) = item.get("name").and_then(Value::as_str) {
+            validate_function_call_field("name", name)?;
+            self.name = Some(name.to_string());
+        }
+        if let Some(arguments) = item.get("arguments").and_then(Value::as_str)
+            && !arguments.is_empty()
+        {
+            validate_function_call_field("arguments", arguments)?;
+            self.arguments = arguments.to_string();
+        }
+        Ok(())
+    }
+
+    fn to_item(&self) -> Result<Value, OpenAiCodexError> {
+        let call_id = self.call_id.as_deref().ok_or_else(|| {
+            OpenAiCodexError::Protocol("streamed function call did not include call_id".to_string())
+        })?;
+        let name = self.name.as_deref().ok_or_else(|| {
+            OpenAiCodexError::Protocol("streamed function call did not include name".to_string())
+        })?;
+        Ok(json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": self.arguments,
+        }))
+    }
+}
+
+fn collect_streaming_function_calls(
+    calls: &BTreeMap<usize, StreamingFunctionCall>,
+) -> Vec<ToolCall> {
+    calls
+        .values()
+        .filter_map(|call| {
+            Some(ToolCall::new(
+                call.call_id.as_deref()?,
+                call.name.as_deref()?,
+                call.arguments.as_str(),
+            ))
+        })
+        .collect()
 }
 
 fn collect_text(pieces: impl Iterator<Item = String>) -> Option<String> {
@@ -835,7 +1330,7 @@ fn set_dir_permissions(_path: &Path) -> Result<(), OpenAiCodexError> {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use ferricode_core::{ModelProvider, ProviderRequest};
+    use ferricode_core::ProviderRequest;
     use tempfile::tempdir;
 
     #[test]
@@ -954,21 +1449,41 @@ mod tests {
 
     #[test]
     fn response_body_uses_hardcoded_model_and_effort() {
-        let request = ProviderRequest::new("fix it", "/repo");
+        let request = ProviderRequest::new("summarize this repository", "/repo");
 
         let body = build_responses_body(&request);
 
         assert_eq!(body["model"], MODEL);
         assert_eq!(body["instructions"], INSTRUCTIONS);
+        assert!(body["instructions"].as_str().unwrap().contains("inspect"));
+        assert!(
+            body["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("filesystem tools")
+        );
         assert_eq!(body["stream"], true);
-        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["tools"][0]["name"], "ferricode_list_directory");
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(
+            body["tools"][0]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(body["tools"][1]["name"], "ferricode_read_file");
+        assert_eq!(body["tools"][1]["strict"], true);
+        assert_eq!(body["tools"][1]["parameters"]["required"], json!(["path"]));
+        assert_eq!(
+            body["tools"][1]["parameters"]["additionalProperties"],
+            false
+        );
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning"]["effort"], REASONING_EFFORT);
         assert_eq!(body["store"], false);
         assert_eq!(
             body["input"][0]["content"][0]["text"],
-            "Working directory: /repo\n\nfix it"
+            "Working directory: /repo\n\nsummarize this repository"
         );
     }
 
@@ -995,6 +1510,262 @@ data: {"type":"response.output_text.delta","delta":"hello"}
 data: [DONE]"#;
 
         assert_eq!(parse_assistant_text(text).unwrap(), "hello");
+    }
+
+    #[test]
+    fn parses_json_function_call_turn() {
+        let text = r#"{"output":[{"type":"function_call","call_id":"call_1","name":"ferricode_list_directory","arguments":"{\"path\":\".\"}"}]}"#;
+
+        let turn = parse_assistant_turn(text).unwrap();
+
+        let ProviderTurn::ToolCalls { state, calls } = turn else {
+            panic!("expected function call turn");
+        };
+        assert_eq!(state.output_items.len(), 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id(), "call_1");
+        assert_eq!(calls[0].name(), "ferricode_list_directory");
+        assert_eq!(calls[0].arguments(), r#"{"path":"."}"#);
+    }
+
+    #[test]
+    fn json_function_call_requires_provider_fields() {
+        let text = r#"{"output":[{"type":"function_call","call_id":"call_1","name":"ferricode_list_directory"}]}"#;
+
+        let error = parse_assistant_turn(text).unwrap_err();
+
+        assert!(error.to_string().contains("arguments"));
+    }
+
+    #[test]
+    fn json_function_call_rejects_oversized_arguments() {
+        let body = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "ferricode_read_file",
+                "arguments": "x".repeat((16 * 1024) + 1),
+            }]
+        })
+        .to_string();
+
+        let error = parse_assistant_turn(&body).unwrap_err();
+
+        assert!(error.to_string().contains("arguments"));
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn parses_streamed_function_call_arguments() {
+        let text = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":""}}
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":\"READ"}
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"ME.md\"}"}
+data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"README.md\"}"}
+data: {"type":"response.completed"}"#;
+
+        let turn = parse_assistant_turn(text).unwrap();
+
+        let ProviderTurn::ToolCalls { state, calls } = turn else {
+            panic!("expected function call turn");
+        };
+        assert_eq!(state.output_items.len(), 1);
+        assert_eq!(
+            state.output_items[0]["arguments"],
+            r#"{"path":"README.md"}"#
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id(), "call_1");
+        assert_eq!(calls[0].name(), "ferricode_read_file");
+        assert_eq!(calls[0].arguments(), r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn parses_streamed_function_call_from_done_item() {
+        let text = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}}
+data: {"type":"response.completed"}"#;
+
+        let turn = parse_assistant_turn(text).unwrap();
+
+        let ProviderTurn::ToolCalls { state, calls } = turn else {
+            panic!("expected function call turn");
+        };
+        assert_eq!(state.output_items.len(), 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id(), "call_1");
+        assert_eq!(calls[0].name(), "ferricode_read_file");
+        assert_eq!(calls[0].arguments(), r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn streamed_function_call_requires_provider_identifiers() {
+        let text = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","arguments":"{}"}}
+data: {"type":"response.completed"}"#;
+
+        let error = parse_assistant_turn(text).unwrap_err();
+
+        assert!(error.to_string().contains("call_id"));
+    }
+
+    #[test]
+    fn streamed_function_call_argument_delta_requires_delta() {
+        let text = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":""}}
+data: {"type":"response.function_call_arguments.delta","output_index":0}
+data: {"type":"response.completed"}"#;
+
+        let error = parse_assistant_turn(text).unwrap_err();
+
+        assert!(error.to_string().contains("delta"));
+    }
+
+    #[test]
+    fn streamed_function_call_argument_delta_requires_output_index() {
+        let text = r#"data: {"type":"response.function_call_arguments.delta","delta":"{}"}
+data: {"type":"response.completed"}"#;
+
+        let error = parse_assistant_turn(text).unwrap_err();
+
+        assert!(error.to_string().contains("output_index"));
+    }
+
+    #[test]
+    fn streamed_function_call_rejects_oversized_argument_delta() {
+        let body = format!(
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"ferricode_read_file\",\"arguments\":\"\"}}}}\n\
+data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}}\n\
+data: {{\"type\":\"response.completed\"}}",
+            "x".repeat((16 * 1024) + 1)
+        );
+
+        let error = parse_assistant_turn(&body).unwrap_err();
+
+        assert!(error.to_string().contains("arguments"));
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn streamed_function_call_rejects_huge_sparse_index() {
+        let text = r#"data: {"type":"response.output_item.added","output_index":999999,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{}"}}
+data: {"type":"response.completed"}"#;
+
+        let error = parse_assistant_turn(text).unwrap_err();
+
+        assert!(error.to_string().contains("output_index"));
+    }
+
+    #[test]
+    fn tool_outputs_body_preserves_prior_items() {
+        let state = OpenAiCodexState {
+            input_items: vec![json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Working directory: /repo\n\nread it"}]
+            })],
+            output_items: vec![json!({
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_1",
+                "name": "ferricode_read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            })],
+        };
+        let outputs = vec![ToolOutput::new(
+            "call_1",
+            r#"{"ok":true,"path":"README.md","content":"hi","truncated":false}"#,
+        )];
+
+        let body = build_tool_outputs_body(state, &outputs);
+
+        assert_eq!(body["input"].as_array().unwrap().len(), 3);
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert!(body["input"][1].get("id").is_none());
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["call_id"], "call_1");
+        assert_eq!(body["input"][2]["output"], outputs[0].output());
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_resume_posts_tool_outputs_and_returns_next_turn() {
+        let (base_url, requests) = spawn_test_server(vec![TestResponse::json(
+            r#"{"output":[{"content":[{"type":"output_text","text":"done"}]}]}"#,
+        )])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        write_auth_file(
+            &path,
+            &auth_with_tokens("access", "refresh", 9_999_999_999_999),
+        )
+        .unwrap();
+        let provider =
+            OpenAiCodexProvider::with_urls(&path, &base_url, format!("{base_url}/codex/responses"));
+        let state = OpenAiCodexState {
+            input_items: vec![json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Working directory: /repo\n\nread it"}]
+            })],
+            output_items: vec![json!({
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_1",
+                "name": "ferricode_read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            })],
+        };
+        let outputs = vec![ToolOutput::new(
+            "call_1",
+            r#"{"ok":true,"path":"README.md","content":"hi","truncated":false}"#,
+        )];
+
+        let turn = provider.resume(state, &outputs).await.unwrap();
+
+        assert_eq!(turn, ProviderTurn::Final("done".to_string()));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("Working directory: /repo"));
+        assert!(requests[0].contains(r#""type":"function_call_output""#));
+        assert!(requests[0].contains(r#""call_id":"call_1""#));
+        assert!(requests[0].contains(r#""output":"{\"ok\":true,"#));
+        assert!(!requests[0].contains(r#""id":"fc_123""#));
+    }
+
+    #[tokio::test]
+    async fn provider_start_state_preserves_input_for_resume() {
+        let (base_url, requests) = spawn_test_server(vec![
+            TestResponse::json(
+                r#"{"output":[{"type":"function_call","id":"fc_123","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}]}"#,
+            ),
+            TestResponse::json(r#"{"output":[{"content":[{"type":"output_text","text":"done"}]}]}"#),
+        ])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        write_auth_file(
+            &path,
+            &auth_with_tokens("access", "refresh", 9_999_999_999_999),
+        )
+        .unwrap();
+        let provider =
+            OpenAiCodexProvider::with_urls(&path, &base_url, format!("{base_url}/codex/responses"));
+        let request = ProviderRequest::new("read it", "/repo");
+
+        let ProviderTurn::ToolCalls { state, calls } = provider.start(&request).await.unwrap()
+        else {
+            panic!("expected tool call turn");
+        };
+        assert_eq!(calls.len(), 1);
+        let outputs = vec![ToolOutput::new(
+            "call_1",
+            r#"{"ok":true,"path":"README.md","content":"hi","truncated":false}"#,
+        )];
+        let turn = provider.resume(state, &outputs).await.unwrap();
+
+        assert_eq!(turn, ProviderTurn::Final("done".to_string()));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("Working directory: /repo"));
+        assert!(requests[1].contains("read it"));
+        assert!(requests[1].contains(r#""type":"function_call_output""#));
     }
 
     #[test]
@@ -1335,6 +2106,54 @@ data: [DONE]"#;
         );
         assert!(requests[0].contains(r#""model":"gpt-5.4""#));
         assert!(requests[0].contains(r#""effort":"medium""#));
+    }
+
+    #[tokio::test]
+    async fn provider_returns_when_sse_completion_arrives_before_eof() {
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            captured
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request).to_string());
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\
+                      data: {\"type\":\"response.output_text.delta\",\"delta\":\"assistant\"}\n\n\
+                      data: {\"type\":\"response.completed\"}\n\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        write_auth_file(
+            &path,
+            &auth_with_tokens("access", "refresh", 9_999_999_999_999),
+        )
+        .unwrap();
+        let base_url = format!("http://{addr}");
+        let provider =
+            OpenAiCodexProvider::with_urls(&path, &base_url, format!("{base_url}/codex/responses"));
+        let request = ProviderRequest::new("hello", "/repo");
+
+        let text = timeout(Duration::from_millis(500), provider.respond(&request))
+            .await
+            .expect("provider should return on the SSE completion event")
+            .unwrap();
+
+        assert_eq!(text, "assistant");
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -133,40 +133,50 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Parser};
-    use ferricode_core::{ModelProvider, ProviderError, ProviderRequest};
+    use ferricode_core::{ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolOutput};
 
     struct StaticProvider;
 
     impl ModelProvider for StaticProvider {
-        async fn respond<'a>(
+        type State = ();
+
+        async fn start<'a>(
             &'a self,
             request: &'a ProviderRequest,
-        ) -> Result<String, ProviderError> {
-            Ok(format!(
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            Ok(ProviderTurn::Final(format!(
                 "provider response from {}: {}",
                 request.working_directory(),
                 request.prompt()
-            ))
+            )))
+        }
+
+        async fn resume<'a>(
+            &'a self,
+            _state: Self::State,
+            _tool_outputs: &'a [ToolOutput],
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            unreachable!("static test provider never requests tools")
         }
     }
 
     #[tokio::test]
     async fn run_uses_default_cwd() {
-        let cli = Cli::try_parse_from(["ferric", "run", "inspect repository"]).unwrap();
+        let cli = Cli::try_parse_from(["ferric", "run", "summarize task"]).unwrap();
 
         let output = super::run(cli, &StaticProvider).await.unwrap();
 
-        assert_eq!(output, "provider response from .: inspect repository");
+        assert_eq!(output, "provider response from .: summarize task");
     }
 
     #[tokio::test]
     async fn run_uses_explicit_cwd() {
         let cli =
-            Cli::try_parse_from(["ferric", "run", "inspect repository", "--cwd", "/work"]).unwrap();
+            Cli::try_parse_from(["ferric", "run", "summarize task", "--cwd", "/work"]).unwrap();
 
         let output = super::run(cli, &StaticProvider).await.unwrap();
 
-        assert_eq!(output, "provider response from /work: inspect repository");
+        assert_eq!(output, "provider response from /work: summarize task");
     }
 
     #[tokio::test]

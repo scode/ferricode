@@ -21,16 +21,28 @@ pub async fn launch(
 
 #[cfg(test)]
 mod tests {
-    use ferricode_core::{HarnessRequest, ModelProvider, ProviderError, ProviderRequest};
+    use ferricode_core::{
+        HarnessRequest, ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolOutput,
+    };
 
     struct StaticProvider;
 
     impl ModelProvider for StaticProvider {
-        async fn respond<'a>(
+        type State = ();
+
+        async fn start<'a>(
             &'a self,
             request: &'a ProviderRequest,
-        ) -> Result<String, ProviderError> {
-            Ok(format!("tui saw {}", request.prompt()))
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            Ok(ProviderTurn::Final(format!("tui saw {}", request.prompt())))
+        }
+
+        async fn resume<'a>(
+            &'a self,
+            _state: Self::State,
+            _tool_outputs: &'a [ToolOutput],
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            unreachable!("static test provider never requests tools")
         }
     }
 

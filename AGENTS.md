@@ -3,6 +3,9 @@
 Stay conformant to `SPEC.md`. If an implementation choice conflicts with the spec, change the implementation or update
 the spec in the same change with a clear reason.
 
+Keep `docs/tools.md` up to date whenever built-in tool behavior changes. This includes tool names, arguments, filesystem
+safety policy, output limits, truncation behavior, and user-visible tool errors.
+
 # Rust
 
 Run these checks before handing off code changes when the toolchain is available:
