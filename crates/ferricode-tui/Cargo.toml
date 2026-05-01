@@ -7,3 +7,6 @@ repository.workspace = true
 
 [dependencies]
 ferricode-core = { version = "0.1.0", path = "../ferricode-core" }
+
+[dev-dependencies]
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }

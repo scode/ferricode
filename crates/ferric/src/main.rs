@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use ferricode_core::{Harness, HarnessRequest};
+use ferricode_core::{Harness, HarnessRequest, ModelProvider};
+use ferricode_openai_codex::{OpenAiCodexProvider, authenticate_openai_codex, default_auth_path};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -17,6 +18,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Configure or refresh credentials stored on this machine.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+
     /// Send a prompt through the core harness.
     Run {
         /// User intent to pass into the harness.
@@ -38,11 +45,19 @@ enum Command {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Sign in with Codex-compatible OpenAI OAuth.
+    OpenaiCodex,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let cli = Cli::parse();
-    let output = run(cli)?;
+    let provider = OpenAiCodexProvider::from_default_auth_path()?;
+    let output = run(cli, &provider).await?;
     println!("{output}");
 
     Ok(())
@@ -50,22 +65,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Runs a parsed CLI request and returns the text the process should print.
 ///
-/// Keeping this separate from `main` lets tests cover the command contract
-/// without spawning the binary, installing a tracing subscriber, or depending
-/// on process-global state.
-fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
+/// Keeping this separate from `main` lets tests cover non-auth command behavior
+/// without spawning the binary or installing a tracing subscriber.
+async fn run(
+    cli: Cli,
+    provider: &impl ModelProvider,
+) -> Result<String, Box<dyn std::error::Error>> {
     match cli.command {
+        Command::Auth { command } => run_auth(command).await,
         Command::Run { prompt, cwd } => {
             let request = HarnessRequest::new(prompt, cwd)?;
-            let response = Harness::new().handle(&request);
+            let response = Harness::new().handle(&request, provider).await?;
             info!(summary = response.summary(), "handled harness request");
             Ok(response.summary().to_owned())
         }
         Command::Tui { prompt, cwd } => {
             let request = HarnessRequest::new(prompt, cwd)?;
-            let response = ferricode_tui::launch(request);
+            let response = ferricode_tui::launch(request, provider).await?;
             info!(summary = response.summary(), "handled tui harness request");
             Ok(response.summary().to_owned())
+        }
+    }
+}
+
+async fn run_auth(command: AuthCommand) -> Result<String, Box<dyn std::error::Error>> {
+    match command {
+        AuthCommand::OpenaiCodex => {
+            let path = default_auth_path()?;
+            let mut stdout = std::io::stdout();
+            authenticate_openai_codex(&path, &mut stdout).await?;
+            Ok(format!("Updated OpenAI Codex tokens in {}", path.display()))
         }
     }
 }
@@ -80,44 +109,62 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Parser};
+    use ferricode_core::{ModelProvider, ProviderError, ProviderRequest};
 
-    #[test]
-    fn run_uses_default_cwd() {
-        let cli = Cli::try_parse_from(["ferric", "run", "inspect repository"]).unwrap();
+    struct StaticProvider;
 
-        let output = super::run(cli).unwrap();
-
-        assert_eq!(output, "Received coding task from .: inspect repository");
+    impl ModelProvider for StaticProvider {
+        async fn respond<'a>(
+            &'a self,
+            request: &'a ProviderRequest,
+        ) -> Result<String, ProviderError> {
+            Ok(format!(
+                "provider response from {}: {}",
+                request.working_directory(),
+                request.prompt()
+            ))
+        }
     }
 
-    #[test]
-    fn run_uses_explicit_cwd() {
+    #[tokio::test]
+    async fn run_uses_default_cwd() {
+        let cli = Cli::try_parse_from(["ferric", "run", "inspect repository"]).unwrap();
+
+        let output = super::run(cli, &StaticProvider).await.unwrap();
+
+        assert_eq!(output, "provider response from .: inspect repository");
+    }
+
+    #[tokio::test]
+    async fn run_uses_explicit_cwd() {
         let cli =
             Cli::try_parse_from(["ferric", "run", "inspect repository", "--cwd", "/work"]).unwrap();
 
-        let output = super::run(cli).unwrap();
+        let output = super::run(cli, &StaticProvider).await.unwrap();
 
-        assert_eq!(
-            output,
-            "Received coding task from /work: inspect repository"
-        );
+        assert_eq!(output, "provider response from /work: inspect repository");
     }
 
-    #[test]
-    fn tui_uses_core_request_contract() {
+    #[tokio::test]
+    async fn tui_uses_core_request_contract() {
         let cli = Cli::try_parse_from(["ferric", "tui", "open screen", "--cwd", "/work"]).unwrap();
 
-        let output = super::run(cli).unwrap();
+        let output = super::run(cli, &StaticProvider).await.unwrap();
 
-        assert_eq!(output, "Received coding task from /work: open screen");
+        assert_eq!(output, "provider response from /work: open screen");
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_is_rejected_after_parsing() {
+        let cli = Cli::try_parse_from(["ferric", "run", "   "]).unwrap();
+
+        let error = super::run(cli, &StaticProvider).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "prompt must not be empty");
     }
 
     #[test]
-    fn empty_prompt_is_rejected_after_parsing() {
-        let cli = Cli::try_parse_from(["ferric", "run", "   "]).unwrap();
-
-        let error = super::run(cli).unwrap_err();
-
-        assert_eq!(error.to_string(), "prompt must not be empty");
+    fn auth_commands_parse() {
+        Cli::try_parse_from(["ferric", "auth", "openai-codex"]).unwrap();
     }
 }

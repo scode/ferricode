@@ -2,25 +2,38 @@
 
 Ferricode is a Rust coding harness. The CLI binary is `ferric`.
 
-This is only the project bootstrap. The current commands exercise the crate boundaries and tracing/Clap wiring; they do
-not run an agent loop yet.
+This is still early bootstrap code. It has a minimal provider boundary and an OpenAI Codex-compatible auth path, but it
+does not have a real agent loop, tools, streaming, or a useful TUI yet.
+
+NOTE: The `openai-codex` provider is not the OpenAI Platform API-key flow. It uses Codex-compatible ChatGPT OAuth in the
+browser and stores the returned account tokens in `~/.ferric/auth.toml`.
 
 # Usage
 
-Send a prompt through the core harness:
+Sign in with OpenAI Codex auth:
+
+```sh
+cargo run -p ferric -- auth openai-codex
+```
+
+The command starts a short-lived callback listener on `127.0.0.1:1455`, opens the browser, and also prints the auth URL
+so you can open it manually.
+
+After auth succeeds, send a prompt through the OpenAI Codex provider:
 
 ```sh
 cargo run -p ferric -- run "inspect repository"
 ```
 
-Both commands accept an explicit working directory context with `--cwd`:
+`run` sends the prompt and working-directory context to the remote Codex backend. Both `run` and `tui` accept an
+explicit working directory context with `--cwd`:
 
 ```sh
 cargo run -p ferric -- run "inspect repository" --cwd /path/to/repo
 ```
 
-The `tui` subcommand currently uses the TUI crate boundary but still returns the same bootstrap response instead of
-drawing a full terminal interface:
+The `tui` subcommand currently uses the TUI crate boundary and prints the same provider-backed remote response instead
+of drawing a full terminal interface:
 
 ```sh
 cargo run -p ferric -- tui "inspect repository" --cwd /path/to/repo

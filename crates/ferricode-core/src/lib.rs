@@ -50,6 +50,39 @@ impl HarnessRequest {
     }
 }
 
+/// The model-facing request produced by the harness.
+///
+/// This deliberately is not a type alias for `HarnessRequest`. The harness
+/// request is the public input contract for Ferricode, while this is the
+/// smaller contract providers receive after the harness has decided what text
+/// and context should be sent to a model. The fields are equivalent today, but
+/// callers should not assume they will stay that way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRequest {
+    prompt: String,
+    working_directory: String,
+}
+
+impl ProviderRequest {
+    /// Builds the narrow request a provider needs to produce assistant text.
+    pub fn new(prompt: impl Into<String>, working_directory: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            working_directory: working_directory.into(),
+        }
+    }
+
+    /// Returns the prompt text selected by the harness for the provider.
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    /// Returns the working directory context selected by the harness.
+    pub fn working_directory(&self) -> &str {
+        &self.working_directory
+    }
+}
+
 /// A harness response that can be rendered by any user interface.
 ///
 /// The response is deliberately small during bootstrap. Keeping it in the core
@@ -74,6 +107,46 @@ impl HarnessResponse {
     }
 }
 
+/// A provider that can turn a model-facing request into assistant text.
+///
+/// This is intentionally narrower than a real agent backend. It does not model
+/// streaming, tool calls, model choice, or conversation state. Those concepts
+/// should enter the trait only when the harness has real behavior that needs
+/// them.
+pub trait ModelProvider {
+    /// Produces assistant text for a single request.
+    fn respond<'a>(
+        &'a self,
+        request: &'a ProviderRequest,
+    ) -> impl std::future::Future<Output = Result<String, ProviderError>> + Send + 'a;
+}
+
+/// Provider failures surfaced through the harness boundary.
+///
+/// The core crate keeps provider errors as user-facing text for now because the
+/// bootstrap harness has no recovery policy beyond reporting the failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderError {
+    message: String,
+}
+
+impl ProviderError {
+    /// Creates a provider error with an actionable message for the caller.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
 /// The UI-independent coding harness coordinator.
 ///
 /// The harness owns policy and task orchestration. It does not parse command
@@ -88,18 +161,19 @@ impl Harness {
         Self
     }
 
-    /// Handles a user request and returns UI-neutral output.
+    /// Handles a user request through the supplied provider.
     ///
-    /// This is intentionally deterministic for now. Future model calls, tool
-    /// execution, or repository inspection should preserve the same boundary:
-    /// caller-provided context enters through `HarnessRequest`, and UI-neutral
-    /// results come back out.
-    pub fn handle(&self, request: &HarnessRequest) -> HarnessResponse {
-        HarnessResponse::new(format!(
-            "Received coding task from {}: {}",
-            request.working_directory(),
-            request.prompt()
-        ))
+    /// The harness stays responsible for orchestration, while the provider owns
+    /// how assistant text is produced. This keeps concrete model backends out
+    /// of the core crate.
+    pub async fn handle(
+        &self,
+        request: &HarnessRequest,
+        provider: &impl ModelProvider,
+    ) -> Result<HarnessResponse, ProviderError> {
+        let provider_request = ProviderRequest::new(request.prompt(), request.working_directory());
+        let summary = provider.respond(&provider_request).await?;
+        Ok(HarnessResponse::new(summary))
     }
 }
 
@@ -122,7 +196,35 @@ impl std::error::Error for HarnessError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Harness, HarnessError, HarnessRequest};
+    use super::{
+        Harness, HarnessError, HarnessRequest, ModelProvider, ProviderError, ProviderRequest,
+    };
+
+    struct EchoProvider;
+
+    impl ModelProvider for EchoProvider {
+        async fn respond<'a>(
+            &'a self,
+            request: &'a ProviderRequest,
+        ) -> Result<String, ProviderError> {
+            Ok(format!(
+                "provider saw {} from {}",
+                request.prompt(),
+                request.working_directory()
+            ))
+        }
+    }
+
+    struct FailingProvider;
+
+    impl ModelProvider for FailingProvider {
+        async fn respond<'a>(
+            &'a self,
+            _request: &'a ProviderRequest,
+        ) -> Result<String, ProviderError> {
+            Err(ProviderError::new("provider failed"))
+        }
+    }
 
     #[test]
     fn rejects_empty_prompts() {
@@ -132,16 +234,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handles_request_context() {
+    #[tokio::test]
+    async fn handles_request_context_through_provider() {
         let harness = Harness::new();
         let request = HarnessRequest::new("inspect failures", "/work").unwrap();
 
-        let response = harness.handle(&request);
+        let response = harness.handle(&request, &EchoProvider).await.unwrap();
 
         assert_eq!(
             response.summary(),
-            "Received coding task from /work: inspect failures"
+            "provider saw inspect failures from /work"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_errors_cross_the_harness_boundary() {
+        let harness = Harness::new();
+        let request = HarnessRequest::new("inspect failures", "/work").unwrap();
+
+        let error = harness
+            .handle(&request, &FailingProvider)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "provider failed");
     }
 }
