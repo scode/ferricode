@@ -33,7 +33,7 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CODEX_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
-const MODEL: &str = "gpt-5.5";
+const MODEL: &str = "gpt-5.4";
 const REASONING_EFFORT: &str = "medium";
 const INSTRUCTIONS: &str =
     "You are Ferricode, a coding harness. Respond directly to the user's request.";
@@ -156,7 +156,7 @@ pub fn read_auth_file(path: &Path) -> Result<AuthFile, OpenAiCodexError> {
     Ok(toml::from_str(&buffer)?)
 }
 
-/// Writes auth state while keeping newly created auth paths private where supported.
+/// Writes auth state without falling back to ambient file permissions.
 pub fn write_auth_file(path: &Path, auth: &AuthFile) -> Result<(), OpenAiCodexError> {
     if let Some(parent) = path.parent() {
         let parent_exists = parent.exists();
@@ -203,7 +203,7 @@ fn reject_symlink(path: &Path) -> Result<(), OpenAiCodexError> {
 /// Performs browser PKCE authentication and stores the returned Codex tokens.
 pub async fn authenticate_openai_codex(
     path: &Path,
-    output: &mut impl Write,
+    output: &mut (impl Write + ?Sized),
 ) -> Result<(), OpenAiCodexError> {
     let listener = bind_callback_listener().await?;
     authenticate_openai_codex_with_listener(path, output, DEFAULT_ISSUER, true, listener).await
@@ -223,7 +223,7 @@ async fn bind_callback_listener() -> Result<TcpListener, OpenAiCodexError> {
 
 async fn authenticate_openai_codex_with_listener(
     path: &Path,
-    output: &mut impl Write,
+    output: &mut (impl Write + ?Sized),
     issuer: &str,
     open_browser: bool,
     listener: TcpListener,
@@ -322,11 +322,9 @@ impl OpenAiCodexProvider {
     }
 
     async fn authenticated_tokens(&self) -> Result<TokenSet, OpenAiCodexError> {
-        let auth = read_auth_file(&self.auth_path)?;
-        let mut tokens = auth
+        let mut tokens = read_auth_file(&self.auth_path)?
             .openai_codex
-            .as_ref()
-            .and_then(|auth| auth.tokens.clone())
+            .and_then(|auth| auth.tokens)
             .ok_or(OpenAiCodexError::MissingTokens)?;
 
         if token_needs_refresh(&tokens, now_unix_ms()?) {
@@ -689,22 +687,18 @@ fn extract_text_from_content_item(value: &Value) -> Option<String> {
 }
 
 fn extract_text_from_event(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(text)) = map.get("output_text") {
-                return Some(text.clone());
-            }
-            if matches!(
-                map.get("type").and_then(Value::as_str),
-                Some("output_text" | "response.output_text.delta")
-            ) && let Some(Value::String(text)) = map.get("text").or_else(|| map.get("delta"))
-            {
-                return Some(text.clone());
-            }
-            None
-        }
-        _ => None,
+    let map = value.as_object()?;
+    if let Some(Value::String(text)) = map.get("output_text") {
+        return Some(text.clone());
     }
+    if matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("output_text" | "response.output_text.delta")
+    ) && let Some(Value::String(text)) = map.get("text").or_else(|| map.get("delta"))
+    {
+        return Some(text.clone());
+    }
+    None
 }
 
 fn collect_text(pieces: impl Iterator<Item = String>) -> Option<String> {
@@ -811,10 +805,10 @@ fn create_secret_file(path: &Path) -> Result<fs::File, OpenAiCodexError> {
 
 #[cfg(not(unix))]
 fn create_secret_file(path: &Path) -> Result<fs::File, OpenAiCodexError> {
-    Ok(fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)?)
+    let _ = path;
+    Err(OpenAiCodexError::Protocol(
+        "OpenAI Codex auth storage requires private Unix file permissions".to_string(),
+    ))
 }
 
 fn now_unix_ms() -> Result<u64, OpenAiCodexError> {
@@ -972,8 +966,10 @@ mod tests {
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning"]["effort"], REASONING_EFFORT);
         assert_eq!(body["store"], false);
-        assert!(body.to_string().contains("/repo"));
-        assert!(body.to_string().contains("fix it"));
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "Working directory: /repo\n\nfix it"
+        );
     }
 
     #[test]
@@ -1337,7 +1333,7 @@ data: [DONE]"#;
                 .to_ascii_lowercase()
                 .contains("authorization: bearer access")
         );
-        assert!(requests[0].contains(r#""model":"gpt-5.5""#));
+        assert!(requests[0].contains(r#""model":"gpt-5.4""#));
         assert!(requests[0].contains(r#""effort":"medium""#));
     }
 

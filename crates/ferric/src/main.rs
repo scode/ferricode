@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 use ferricode_core::{Harness, HarnessRequest, ModelProvider};
 use ferricode_openai_codex::{OpenAiCodexProvider, authenticate_openai_codex, default_auth_path};
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -89,14 +92,35 @@ async fn run(
 }
 
 async fn run_auth(command: AuthCommand) -> Result<String, Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout();
+    run_auth_with(command, &mut stdout, authenticate_openai_codex_boxed).await
+}
+
+type AuthFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + 'a>>;
+type Authenticator = for<'a> fn(&'a Path, &'a mut dyn std::io::Write) -> AuthFuture<'a>;
+
+async fn run_auth_with(
+    command: AuthCommand,
+    output: &mut dyn std::io::Write,
+    authenticate: Authenticator,
+) -> Result<String, Box<dyn std::error::Error>> {
     match command {
         AuthCommand::OpenaiCodex => {
             let path = default_auth_path()?;
-            let mut stdout = std::io::stdout();
-            authenticate_openai_codex(&path, &mut stdout).await?;
+            authenticate(&path, output).await?;
             Ok(format!("Updated OpenAI Codex tokens in {}", path.display()))
         }
     }
+}
+
+fn authenticate_openai_codex_boxed<'a>(
+    path: &'a Path,
+    output: &'a mut dyn std::io::Write,
+) -> AuthFuture<'a> {
+    Box::pin(async move {
+        authenticate_openai_codex(path, output).await?;
+        Ok(())
+    })
 }
 
 /// Initializes tracing from `RUST_LOG` without making libraries process-aware.
@@ -166,5 +190,28 @@ mod tests {
     #[test]
     fn auth_commands_parse() {
         Cli::try_parse_from(["ferric", "auth", "openai-codex"]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_command_dispatches_openai_codex_auth() {
+        fn authenticate<'a>(
+            path: &'a std::path::Path,
+            output: &'a mut dyn std::io::Write,
+        ) -> super::AuthFuture<'a> {
+            Box::pin(async move {
+                assert!(path.ends_with(".ferric/auth.toml"));
+                writeln!(output, "auth called")?;
+                Ok(())
+            })
+        }
+
+        let mut output = Vec::new();
+        let message =
+            super::run_auth_with(super::AuthCommand::OpenaiCodex, &mut output, authenticate)
+                .await
+                .unwrap();
+
+        assert!(message.contains("Updated OpenAI Codex tokens in"));
+        assert_eq!(String::from_utf8(output).unwrap(), "auth called\n");
     }
 }
