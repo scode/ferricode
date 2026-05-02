@@ -2,8 +2,8 @@
 
 Ferricode is a Rust coding harness. The CLI binary is `ferric`.
 
-This is still early bootstrap code. It has a minimal provider boundary and an OpenAI Codex-compatible auth path, but it
-does not have a real agent loop, tools, streaming, or a useful TUI yet.
+This is still early bootstrap code. It has an OpenAI Codex-compatible auth path and a small read-only built-in tool
+loop, but it does not have MCP, mutation tools, public streaming, or a useful TUI yet.
 
 NOTE: The `openai-codex` provider is not the OpenAI Platform API-key flow. It uses Codex-compatible ChatGPT OAuth in the
 browser and stores the returned account tokens in `~/.ferric/auth.toml`.
@@ -22,21 +22,24 @@ auth URL so you can open it manually.
 After auth succeeds, send a prompt through the OpenAI Codex provider:
 
 ```sh
-cargo run -p ferric -- run "inspect repository"
+cargo run -p ferric -- run "summarize this repository"
 ```
 
-`run` sends the prompt and working-directory context to the remote Codex backend. Both `run` and `tui` accept an
-explicit working directory context with `--cwd`:
+`run` sends the prompt and working-directory context to the remote Codex backend. The model can ask Ferricode to run
+built-in read-only tools when it needs local repository context. Both `run` and `tui` accept an explicit working
+directory context with `--cwd`:
 
 ```sh
-cargo run -p ferric -- run "inspect repository" --cwd /path/to/repo
+cargo run -p ferric -- run "summarize this repository" --cwd /path/to/repo
 ```
 
-The `tui` subcommand currently uses the TUI crate boundary and prints the same provider-backed remote response instead
-of drawing a full terminal interface:
+See `docs/tools.md` for the current built-in tool behavior and filesystem limits.
+
+The `tui` subcommand currently uses the TUI crate boundary and prints the same harness response instead of drawing a
+full terminal interface:
 
 ```sh
-cargo run -p ferric -- tui "inspect repository" --cwd /path/to/repo
+cargo run -p ferric -- tui "summarize this repository" --cwd /path/to/repo
 ```
 
 # Architecture

@@ -34,8 +34,12 @@ providers receive the narrower model-facing request that the harness chooses to 
 same during bootstrap, but they must not be treated as interchangeable.
 
 The bootstrap provider interface is intentionally small: one prompt and working-directory context in, one assistant text
-response out. Do not add registries, model selection, public streaming APIs, tool calls, multi-turn state, or provider
-fallback until the harness actually needs them.
+response out, with a narrow exception for core-owned built-in tools. Do not add registries, model selection, public
+streaming APIs, MCP, mutation tools, or provider fallback until the harness actually needs them.
+
+Core owns built-in tool orchestration and local tool policy. The first supported tools are read-only filesystem tools:
+directory listing and UTF-8 file reading under the request working directory. Provider crates may expose those tools
+through provider-specific wire formats, but they must not own the filesystem safety policy.
 
 The first provider is `ferricode-openai-codex`. Its public provider name is `openai-codex`. It uses Codex-compatible
 ChatGPT OAuth, not the OpenAI Platform API key path. For now it hardcodes `gpt-5.4` and medium reasoning effort.
@@ -87,6 +91,6 @@ dependency injection or explicit configuration instead.
 
 # Current Non-Goals
 
-Do not add OpenAI Platform API-key support, model flags, reasoning-effort flags, public streaming APIs, tool calls,
-multi-turn state, keyring storage, or real TUI rendering in the bootstrap provider change. Provider internals may parse
-buffered SSE when the upstream transport requires it, but that must not leak into the core provider trait yet.
+Do not add OpenAI Platform API-key support, model flags, reasoning-effort flags, public streaming APIs, MCP, mutation
+tools, keyring storage, or real TUI rendering in the bootstrap provider change. Provider internals may parse buffered
+SSE when the upstream transport requires it, but that must not become a public streaming API yet.
