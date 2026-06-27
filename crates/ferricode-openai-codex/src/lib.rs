@@ -227,6 +227,12 @@ pub async fn authenticate_openai_codex(
     .await
 }
 
+/// Treats the loopback listener as a convenience path, not a hard auth requirement.
+///
+/// Port conflicts are common when a previous auth run is still around or another
+/// tool uses the same Codex callback port. In that case auth can still complete
+/// from a pasted localhost callback URL, so only non-port-conflict bind failures
+/// abort the command.
 fn callback_listener_or_paste_only(
     listener: Result<TcpListener, OpenAiCodexError>,
     output: &mut (impl Write + ?Sized),
@@ -244,6 +250,7 @@ fn callback_listener_or_paste_only(
     }
 }
 
+/// Binds the fixed Codex callback port and preserves port conflicts as a user-facing auth mode.
 async fn bind_callback_listener() -> Result<TcpListener, OpenAiCodexError> {
     TcpListener::bind((CALLBACK_HOST, CALLBACK_PORT))
         .await
@@ -256,9 +263,21 @@ async fn bind_callback_listener() -> Result<TcpListener, OpenAiCodexError> {
         })
 }
 
+/// One-shot source for a pasted browser callback URL.
+///
+/// `None` means stdin reached EOF before a URL was entered. That is fatal in
+/// paste-only mode, but with a live HTTP listener it just disables the paste path
+/// and lets the browser callback keep working.
 type PastedCallbackFuture =
     Pin<Box<dyn Future<Output = Result<Option<String>, OpenAiCodexError>> + Send>>;
 
+/// Runs the Codex PKCE browser flow through whichever callback path is available.
+///
+/// The HTTP listener and pasted URL path intentionally converge before state
+/// validation and token exchange. While both paths are pending, the code only
+/// races pasted input against accepting a connection; once a browser connection
+/// is accepted, that callback is processed to completion so a late stdin EOF
+/// cannot cancel an in-flight OAuth callback.
 async fn authenticate_openai_codex_with_inputs(
     path: &Path,
     output: &mut (impl Write + ?Sized),
@@ -335,10 +354,15 @@ async fn authenticate_openai_codex_with_inputs(
     }
 }
 
+/// Reads at most one terminal line without tying the async runtime to blocking stdin.
+///
+/// A detached OS thread is deliberate here. The HTTP callback may finish first,
+/// and a Tokio blocking task stuck in `stdin().read_line()` would still need to be
+/// joined before the CLI could exit. The returned future resolves to `None` on
+/// EOF so the caller can distinguish "no pasted URL is coming" from malformed
+/// pasted input.
 fn read_pasted_callback_from_stdin() -> PastedCallbackFuture {
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    // The HTTP callback may win the race. A detached OS thread lets the CLI return
-    // without waiting for an uncancellable Tokio blocking task stuck on stdin.
     std::thread::spawn(move || {
         let mut line = String::new();
         let result = std::io::stdin()
@@ -357,6 +381,11 @@ fn read_pasted_callback_from_stdin() -> PastedCallbackFuture {
     })
 }
 
+/// Processes an already-accepted callback connection to a terminal response.
+///
+/// This function owns the accepted stream until it has either completed auth or
+/// sent a recoverable error response. Keeping this separate from `accept()` lets
+/// the auth loop race pasted input only while no browser connection is in hand.
 async fn handle_http_callback_stream(
     mut stream: TcpStream,
     auth_path: &Path,
@@ -754,6 +783,11 @@ enum CallbackAction {
     Complete,
 }
 
+/// Converts an HTTP request target into the shared callback URL path.
+///
+/// Request targets are accepted only in origin-form (`/path?...`). Absolute URLs
+/// are not needed for the local callback listener and are treated as malformed
+/// callback requests.
 async fn process_callback_target(
     auth_path: &Path,
     issuer: &str,
@@ -766,6 +800,11 @@ async fn process_callback_target(
     process_callback_url(auth_path, issuer, expected_state, pkce, parsed, client).await
 }
 
+/// Validates a pasted browser URL before using the shared callback processor.
+///
+/// Pasted URLs are untrusted terminal input. They must be the exact localhost
+/// callback origin/path used by the Codex OAuth flow before the code is allowed
+/// to reach state validation or token exchange.
 async fn process_pasted_callback_url(
     auth_path: &Path,
     issuer: &str,
@@ -778,6 +817,11 @@ async fn process_pasted_callback_url(
     process_callback_url(auth_path, issuer, expected_state, pkce, parsed, client).await
 }
 
+/// Applies the OAuth callback contract shared by HTTP and pasted callbacks.
+///
+/// Non-callback paths return `Continue` so the HTTP listener can ignore browser
+/// noise such as `/favicon.ico`. Once the path is the callback path, state
+/// validation happens before any token exchange or auth file write.
 async fn process_callback_url(
     auth_path: &Path,
     issuer: &str,
@@ -817,6 +861,7 @@ async fn process_callback_url(
     Ok(CallbackAction::Complete)
 }
 
+/// Reconstructs a localhost callback URL from an HTTP request target.
 fn callback_url_from_request_target(target: &str) -> Result<url::Url, OpenAiCodexError> {
     if !target.starts_with('/') {
         return Err(OpenAiCodexError::InvalidCallbackRequest);
@@ -824,6 +869,11 @@ fn callback_url_from_request_target(target: &str) -> Result<url::Url, OpenAiCode
     Ok(url::Url::parse(&format!("http://localhost{target}"))?)
 }
 
+/// Parses pasted callback input and rejects URLs outside the Codex localhost callback.
+///
+/// `read_line` keeps the terminal newline, so this parser trims surrounding
+/// whitespace before validation. It still rejects alternate schemes, hosts,
+/// ports, and paths before state or authorization code handling.
 fn callback_url_from_pasted_url(pasted_url: &str) -> Result<url::Url, OpenAiCodexError> {
     let parsed = url::Url::parse(pasted_url.trim())?;
     if parsed.scheme() != "http"
@@ -836,6 +886,11 @@ fn callback_url_from_pasted_url(pasted_url: &str) -> Result<url::Url, OpenAiCode
     Ok(parsed)
 }
 
+/// Classifies callback failures that should keep the HTTP listener alive.
+///
+/// Browser noise and user retryable callback mistakes get an HTTP error response
+/// but do not end the auth command. OAuth provider errors are not recoverable
+/// here: they represent the actual authorization result.
 fn callback_error_is_recoverable(error: &OpenAiCodexError) -> bool {
     matches!(
         error,
@@ -846,6 +901,11 @@ fn callback_error_is_recoverable(error: &OpenAiCodexError) -> bool {
     )
 }
 
+/// Reads the request target from the small HTTP subset needed for OAuth callbacks.
+///
+/// This is intentionally not a general HTTP parser. It accepts a single GET
+/// request line, stops after headers, and caps request bytes so callback noise
+/// cannot grow memory without bound.
 async fn read_http_target(stream: &mut TcpStream) -> Result<String, OpenAiCodexError> {
     let mut request = Vec::new();
     let mut buffer = [0; 1024];
