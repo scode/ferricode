@@ -51,9 +51,15 @@ The bootstrap credential store is `~/.ferric/auth.toml`. This is an intentional 
 `ferric auth openai-codex` starts browser PKCE OAuth against `https://auth.openai.com`. It uses the Codex public client
 ID (`app_EMoamEEZ73f0CkXaXp7hrann`).
 
-The browser callback is fixed to `http://localhost:1455/auth/callback`. The listener binds `127.0.0.1:1455`, while the
-OAuth redirect URI remains `localhost` to match the Codex flow. If the port is unavailable, the command should fail
-clearly.
+The browser callback is fixed to `http://localhost:1455/auth/callback`. The listener tries to bind `127.0.0.1:1455`,
+while the OAuth redirect URI remains `localhost` to match the Codex flow. The listener is a convenience path, not the
+only supported path: if the port is unavailable, or if the browser is local while `ferric` is running remotely, the
+command must accept the final `localhost` callback URL pasted into the terminal.
+
+HTTP callbacks and pasted callback URLs must converge before state validation and token exchange. Both paths validate
+the generated state, use the same PKCE verifier, and exchange the code with the fixed redirect URI
+`http://localhost:1455/auth/callback`. Pasted URLs are untrusted input; URLs that are not the expected localhost
+callback must be rejected without exchanging a token.
 
 The authorization request must include PKCE (`code_challenge_method=S256`), a generated state value, scopes
 `openid profile email offline_access api.connectors.read api.connectors.invoke`, `id_token_add_organizations=true`,

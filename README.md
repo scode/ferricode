@@ -19,8 +19,11 @@ Sign in with OpenAI Codex auth:
 cargo run -p ferric -- auth openai-codex
 ```
 
-The command starts a short-lived callback listener on `127.0.0.1:1455`, tries to open the browser, and also prints the
-auth URL so you can open it manually.
+The command tries to start a short-lived callback listener on `127.0.0.1:1455`, tries to open the browser, and also
+prints the auth URL so you can open it manually. If the port is already in use, it falls back to pasted callback URLs.
+That pasted-URL path also matters when `ferric` is running on a remote machine and your browser is local: the browser
+may end at a failed `http://localhost:1455/auth/callback?...` page, but that URL still contains the authorization code
+the remote process needs.
 
 After auth succeeds, send a prompt through the OpenAI Codex provider:
 
