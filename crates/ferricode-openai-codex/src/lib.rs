@@ -256,25 +256,6 @@ async fn bind_callback_listener() -> Result<TcpListener, OpenAiCodexError> {
         })
 }
 
-#[cfg(test)]
-async fn authenticate_openai_codex_with_listener(
-    path: &Path,
-    output: &mut (impl Write + ?Sized),
-    issuer: &str,
-    open_browser: bool,
-    listener: TcpListener,
-) -> Result<(), OpenAiCodexError> {
-    authenticate_openai_codex_with_inputs(
-        path,
-        output,
-        issuer,
-        open_browser,
-        Some(listener),
-        Box::pin(std::future::pending()),
-    )
-    .await
-}
-
 type PastedCallbackFuture =
     Pin<Box<dyn Future<Output = Result<Option<String>, OpenAiCodexError>> + Send>>;
 
@@ -343,7 +324,9 @@ async fn authenticate_openai_codex_with_inputs(
                 }
             }
             None => {
-                if handle_http_callback(listener, path, issuer, &state, &pkce, &client).await? {
+                let (stream, _) = listener.accept().await?;
+                if handle_http_callback_stream(stream, path, issuer, &state, &pkce, &client).await?
+                {
                     writeln!(output, "OpenAI Codex authentication complete.")?;
                     return Ok(());
                 }
@@ -372,18 +355,6 @@ fn read_pasted_callback_from_stdin() -> PastedCallbackFuture {
             )
         })?
     })
-}
-
-async fn handle_http_callback(
-    listener: &TcpListener,
-    auth_path: &Path,
-    issuer: &str,
-    expected_state: &str,
-    pkce: &PkceCodes,
-    client: &reqwest::Client,
-) -> Result<bool, OpenAiCodexError> {
-    let (stream, _) = listener.accept().await?;
-    handle_http_callback_stream(stream, auth_path, issuer, expected_state, pkce, client).await
 }
 
 async fn handle_http_callback_stream(
@@ -2053,8 +2024,15 @@ data: {"type":"response.completed"}"#;
 
         let auth_task = tokio::spawn(async move {
             let mut output = output;
-            authenticate_openai_codex_with_listener(&path, &mut output, &base_url, false, listener)
-                .await
+            authenticate_openai_codex_with_inputs(
+                &path,
+                &mut output,
+                &base_url,
+                false,
+                Some(listener),
+                Box::pin(std::future::pending()),
+            )
+            .await
         });
         let state = wait_for_state(&captured_output).await;
 
@@ -2102,7 +2080,7 @@ data: {"type":"response.completed"}"#;
         .await;
         let dir = tempdir().unwrap();
         let path = dir.path().join("auth.toml");
-        let output = SharedOutput::default();
+        let mut output = SharedOutput::default();
         let captured_output = output.clone();
         let pasted_callback = Box::pin(async move {
             let state = wait_for_state(&captured_output).await;
@@ -2111,7 +2089,6 @@ data: {"type":"response.completed"}"#;
             )))
         });
 
-        let mut output = output;
         authenticate_openai_codex_with_inputs(
             &path,
             &mut output,
@@ -2136,6 +2113,32 @@ data: {"type":"response.completed"}"#;
     }
 
     #[tokio::test]
+    async fn auth_without_listener_fails_when_pasted_callback_is_eof() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let mut output = SharedOutput::default();
+        let pasted_callback = Box::pin(async { Ok(None) });
+
+        let error = authenticate_openai_codex_with_inputs(
+            &path,
+            &mut output,
+            "http://127.0.0.1:9",
+            false,
+            None,
+            pasted_callback,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OpenAiCodexError::Protocol(_)));
+        assert_eq!(
+            error.to_string(),
+            "failed to read pasted OpenAI Codex auth callback URL"
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
     async fn auth_with_listener_completes_when_pasted_callback_wins() {
         let id_token = id_token("acct_auth", "plus");
         let (base_url, requests) = spawn_test_server(vec![TestResponse::json(&token_json(
@@ -2145,7 +2148,7 @@ data: {"type":"response.completed"}"#;
         let dir = tempdir().unwrap();
         let path = dir.path().join("auth.toml");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let output = SharedOutput::default();
+        let mut output = SharedOutput::default();
         let captured_output = output.clone();
         let pasted_callback = Box::pin(async move {
             let state = wait_for_state(&captured_output).await;
@@ -2154,7 +2157,6 @@ data: {"type":"response.completed"}"#;
             )))
         });
 
-        let mut output = output;
         authenticate_openai_codex_with_inputs(
             &path,
             &mut output,
@@ -2324,7 +2326,7 @@ data: {"type":"response.completed"}"#;
             &base_url,
             "expected-state",
             &pkce,
-            "http://localhost:1455/auth/callback?state=expected-state&code=auth-code",
+            "  http://localhost:1455/auth/callback?state=expected-state&code=auth-code\n",
             &reqwest::Client::new(),
         )
         .await
