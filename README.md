@@ -1,5 +1,8 @@
 # Ferricode
 
+NOTE: This is a playground and learning project. I am sharing it publicly in case it is interesting to someone else, but
+it is not meant for actual use at this time.
+
 Ferricode is a Rust coding harness. The CLI binary is `ferric`.
 
 This is still early bootstrap code. It has an OpenAI Codex-compatible auth path and a small read-only built-in tool
