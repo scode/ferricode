@@ -15,8 +15,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::future::Future;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -61,6 +63,8 @@ pub enum OpenAiCodexError {
     CallbackPortInUse,
     #[error("OpenAI Codex auth callback was not a valid HTTP request")]
     InvalidCallbackRequest,
+    #[error("pasted OpenAI Codex auth callback URL was not http://localhost:1455/auth/callback")]
+    InvalidPastedCallbackUrl,
     #[error("OpenAI Codex auth callback state did not match")]
     StateMismatch,
     #[error("OpenAI Codex auth callback returned {error}: {description}")]
@@ -211,10 +215,42 @@ pub async fn authenticate_openai_codex(
     path: &Path,
     output: &mut (impl Write + ?Sized),
 ) -> Result<(), OpenAiCodexError> {
-    let listener = bind_callback_listener().await?;
-    authenticate_openai_codex_with_listener(path, output, DEFAULT_ISSUER, true, listener).await
+    let listener = callback_listener_or_paste_only(bind_callback_listener().await, output)?;
+    authenticate_openai_codex_with_inputs(
+        path,
+        output,
+        DEFAULT_ISSUER,
+        true,
+        listener,
+        read_pasted_callback_from_stdin(),
+    )
+    .await
 }
 
+/// Treats the loopback listener as a convenience path, not a hard auth requirement.
+///
+/// Port conflicts are common when a previous auth run is still around or another
+/// tool uses the same Codex callback port. In that case auth can still complete
+/// from a pasted localhost callback URL, so only non-port-conflict bind failures
+/// abort the command.
+fn callback_listener_or_paste_only(
+    listener: Result<TcpListener, OpenAiCodexError>,
+    output: &mut (impl Write + ?Sized),
+) -> Result<Option<TcpListener>, OpenAiCodexError> {
+    match listener {
+        Ok(listener) => Ok(Some(listener)),
+        Err(OpenAiCodexError::CallbackPortInUse) => {
+            writeln!(
+                output,
+                "OpenAI Codex auth callback port 1455 is already in use; continuing with pasted redirect URL only."
+            )?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Binds the fixed Codex callback port and preserves port conflicts as a user-facing auth mode.
 async fn bind_callback_listener() -> Result<TcpListener, OpenAiCodexError> {
     TcpListener::bind((CALLBACK_HOST, CALLBACK_PORT))
         .await
@@ -227,16 +263,33 @@ async fn bind_callback_listener() -> Result<TcpListener, OpenAiCodexError> {
         })
 }
 
-async fn authenticate_openai_codex_with_listener(
+/// One-shot source for a pasted browser callback URL.
+///
+/// `None` means stdin reached EOF before a URL was entered. That is fatal in
+/// paste-only mode, but with a live HTTP listener it just disables the paste path
+/// and lets the browser callback keep working.
+type PastedCallbackFuture =
+    Pin<Box<dyn Future<Output = Result<Option<String>, OpenAiCodexError>> + Send>>;
+
+/// Runs the Codex PKCE browser flow through whichever callback path is available.
+///
+/// The HTTP listener and pasted URL path intentionally converge before state
+/// validation and token exchange. While both paths are pending, the code only
+/// races pasted input against accepting a connection; once a browser connection
+/// is accepted, that callback is processed to completion so a late stdin EOF
+/// cannot cancel an in-flight OAuth callback.
+async fn authenticate_openai_codex_with_inputs(
     path: &Path,
     output: &mut (impl Write + ?Sized),
     issuer: &str,
     open_browser: bool,
-    listener: TcpListener,
+    listener: Option<TcpListener>,
+    pasted_callback: PastedCallbackFuture,
 ) -> Result<(), OpenAiCodexError> {
     let pkce = generate_pkce();
     let state = generate_state();
     let authorize_url = build_authorize_url(issuer, CODEX_CLIENT_ID, REDIRECT_URI, &pkce, &state);
+    let client = reqwest::Client::new();
 
     if open_browser {
         let _ = webbrowser::open(&authorize_url);
@@ -246,43 +299,124 @@ async fn authenticate_openai_codex_with_listener(
         "Open this URL to sign in with OpenAI Codex auth:\n\n{}\n",
         authorize_url
     )?;
+    writeln!(
+        output,
+        "If your browser ends at a localhost error, paste the full broken URL here:"
+    )?;
+    output.flush()?;
 
+    let Some(listener) = listener.as_ref() else {
+        let pasted = pasted_callback.await?.ok_or_else(|| {
+            OpenAiCodexError::Protocol(
+                "failed to read pasted OpenAI Codex auth callback URL".to_string(),
+            )
+        })?;
+        process_pasted_callback_url(path, issuer, &state, &pkce, &pasted, &client).await?;
+        writeln!(output, "OpenAI Codex authentication complete.")?;
+        return Ok(());
+    };
+
+    let mut pasted_callback = Some(pasted_callback);
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        let target = timeout(CALLBACK_READ_TIMEOUT, read_http_target(&mut stream))
-            .await
-            .unwrap_or(Err(OpenAiCodexError::InvalidCallbackRequest));
-        let result = match target {
-            Ok(target) => {
-                process_callback_target(
-                    path,
-                    issuer,
-                    &state,
-                    &pkce,
-                    &target,
-                    &reqwest::Client::new(),
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-
-        match result {
-            Ok(CallbackAction::Continue) => {
-                write_http_response(&mut stream, 404, "Not Found").await?;
-            }
-            Ok(CallbackAction::Complete) => {
-                write_http_response(&mut stream, 200, "OpenAI Codex authentication complete.")
-                    .await?;
-                writeln!(output, "OpenAI Codex authentication complete.")?;
-                return Ok(());
-            }
-            Err(error) => {
-                write_http_response(&mut stream, 400, &error.to_string()).await?;
-                if callback_error_is_recoverable(&error) {
-                    continue;
+        match pasted_callback.as_mut() {
+            Some(callback) => {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted?;
+                        if handle_http_callback_stream(stream, path, issuer, &state, &pkce, &client).await? {
+                            writeln!(output, "OpenAI Codex authentication complete.")?;
+                            return Ok(());
+                        }
+                    }
+                    result = callback => {
+                        match result? {
+                            Some(pasted) => {
+                                process_pasted_callback_url(path, issuer, &state, &pkce, &pasted, &client).await?;
+                                writeln!(output, "OpenAI Codex authentication complete.")?;
+                                return Ok(());
+                            }
+                            None => {
+                                pasted_callback = None;
+                            }
+                        }
+                    }
                 }
-                return Err(error);
+            }
+            None => {
+                let (stream, _) = listener.accept().await?;
+                if handle_http_callback_stream(stream, path, issuer, &state, &pkce, &client).await?
+                {
+                    writeln!(output, "OpenAI Codex authentication complete.")?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Reads at most one terminal line without tying the async runtime to blocking stdin.
+///
+/// A detached OS thread is deliberate here. The HTTP callback may finish first,
+/// and a Tokio blocking task stuck in `stdin().read_line()` would still need to be
+/// joined before the CLI could exit. The returned future resolves to `None` on
+/// EOF so the caller can distinguish "no pasted URL is coming" from malformed
+/// pasted input.
+fn read_pasted_callback_from_stdin() -> PastedCallbackFuture {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::stdin()
+            .read_line(&mut line)
+            .map(|bytes| (bytes > 0).then_some(line))
+            .map_err(OpenAiCodexError::Io);
+        let _ = sender.send(result);
+    });
+
+    Box::pin(async move {
+        receiver.await.map_err(|_| {
+            OpenAiCodexError::Protocol(
+                "failed to read pasted OpenAI Codex auth callback URL".to_string(),
+            )
+        })?
+    })
+}
+
+/// Processes an already-accepted callback connection to a terminal response.
+///
+/// This function owns the accepted stream until it has either completed auth or
+/// sent a recoverable error response. Keeping this separate from `accept()` lets
+/// the auth loop race pasted input only while no browser connection is in hand.
+async fn handle_http_callback_stream(
+    mut stream: TcpStream,
+    auth_path: &Path,
+    issuer: &str,
+    expected_state: &str,
+    pkce: &PkceCodes,
+    client: &reqwest::Client,
+) -> Result<bool, OpenAiCodexError> {
+    let result = match timeout(CALLBACK_READ_TIMEOUT, read_http_target(&mut stream)).await {
+        Ok(Ok(target)) => {
+            process_callback_target(auth_path, issuer, expected_state, pkce, &target, client).await
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(OpenAiCodexError::InvalidCallbackRequest),
+    };
+
+    match result {
+        Ok(CallbackAction::Continue) => {
+            write_http_response(&mut stream, 404, "Not Found").await?;
+            Ok(false)
+        }
+        Ok(CallbackAction::Complete) => {
+            write_http_response(&mut stream, 200, "OpenAI Codex authentication complete.").await?;
+            Ok(true)
+        }
+        Err(error) => {
+            write_http_response(&mut stream, 400, &error.to_string()).await?;
+            if callback_error_is_recoverable(&error) {
+                Ok(false)
+            } else {
+                Err(error)
             }
         }
     }
@@ -649,6 +783,11 @@ enum CallbackAction {
     Complete,
 }
 
+/// Converts an HTTP request target into the shared callback URL path.
+///
+/// Request targets are accepted only in origin-form (`/path?...`). Absolute URLs
+/// are not needed for the local callback listener and are treated as malformed
+/// callback requests.
 async fn process_callback_target(
     auth_path: &Path,
     issuer: &str,
@@ -657,7 +796,40 @@ async fn process_callback_target(
     target: &str,
     client: &reqwest::Client,
 ) -> Result<CallbackAction, OpenAiCodexError> {
-    let parsed = url::Url::parse(&format!("http://localhost{target}"))?;
+    let parsed = callback_url_from_request_target(target)?;
+    process_callback_url(auth_path, issuer, expected_state, pkce, parsed, client).await
+}
+
+/// Validates a pasted browser URL before using the shared callback processor.
+///
+/// Pasted URLs are untrusted terminal input. They must be the exact localhost
+/// callback origin/path used by the Codex OAuth flow before the code is allowed
+/// to reach state validation or token exchange.
+async fn process_pasted_callback_url(
+    auth_path: &Path,
+    issuer: &str,
+    expected_state: &str,
+    pkce: &PkceCodes,
+    pasted_url: &str,
+    client: &reqwest::Client,
+) -> Result<CallbackAction, OpenAiCodexError> {
+    let parsed = callback_url_from_pasted_url(pasted_url)?;
+    process_callback_url(auth_path, issuer, expected_state, pkce, parsed, client).await
+}
+
+/// Applies the OAuth callback contract shared by HTTP and pasted callbacks.
+///
+/// Non-callback paths return `Continue` so the HTTP listener can ignore browser
+/// noise such as `/favicon.ico`. Once the path is the callback path, state
+/// validation happens before any token exchange or auth file write.
+async fn process_callback_url(
+    auth_path: &Path,
+    issuer: &str,
+    expected_state: &str,
+    pkce: &PkceCodes,
+    parsed: url::Url,
+    client: &reqwest::Client,
+) -> Result<CallbackAction, OpenAiCodexError> {
     if parsed.path() != CALLBACK_PATH {
         return Ok(CallbackAction::Continue);
     }
@@ -689,6 +861,36 @@ async fn process_callback_target(
     Ok(CallbackAction::Complete)
 }
 
+/// Reconstructs a localhost callback URL from an HTTP request target.
+fn callback_url_from_request_target(target: &str) -> Result<url::Url, OpenAiCodexError> {
+    if !target.starts_with('/') {
+        return Err(OpenAiCodexError::InvalidCallbackRequest);
+    }
+    Ok(url::Url::parse(&format!("http://localhost{target}"))?)
+}
+
+/// Parses pasted callback input and rejects URLs outside the Codex localhost callback.
+///
+/// `read_line` keeps the terminal newline, so this parser trims surrounding
+/// whitespace before validation. It still rejects alternate schemes, hosts,
+/// ports, and paths before state or authorization code handling.
+fn callback_url_from_pasted_url(pasted_url: &str) -> Result<url::Url, OpenAiCodexError> {
+    let parsed = url::Url::parse(pasted_url.trim())?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("localhost")
+        || parsed.port_or_known_default() != Some(CALLBACK_PORT)
+        || parsed.path() != CALLBACK_PATH
+    {
+        return Err(OpenAiCodexError::InvalidPastedCallbackUrl);
+    }
+    Ok(parsed)
+}
+
+/// Classifies callback failures that should keep the HTTP listener alive.
+///
+/// Browser noise and user retryable callback mistakes get an HTTP error response
+/// but do not end the auth command. OAuth provider errors are not recoverable
+/// here: they represent the actual authorization result.
 fn callback_error_is_recoverable(error: &OpenAiCodexError) -> bool {
     matches!(
         error,
@@ -699,6 +901,11 @@ fn callback_error_is_recoverable(error: &OpenAiCodexError) -> bool {
     )
 }
 
+/// Reads the request target from the small HTTP subset needed for OAuth callbacks.
+///
+/// This is intentionally not a general HTTP parser. It accepts a single GET
+/// request line, stops after headers, and caps request bytes so callback noise
+/// cannot grow memory without bound.
 async fn read_http_target(stream: &mut TcpStream) -> Result<String, OpenAiCodexError> {
     let mut request = Vec::new();
     let mut buffer = [0; 1024];
@@ -1877,8 +2084,15 @@ data: {"type":"response.completed"}"#;
 
         let auth_task = tokio::spawn(async move {
             let mut output = output;
-            authenticate_openai_codex_with_listener(&path, &mut output, &base_url, false, listener)
-                .await
+            authenticate_openai_codex_with_inputs(
+                &path,
+                &mut output,
+                &base_url,
+                false,
+                Some(listener),
+                Box::pin(std::future::pending()),
+            )
+            .await
         });
         let state = wait_for_state(&captured_output).await;
 
@@ -1899,6 +2113,216 @@ data: {"type":"response.completed"}"#;
                 .unwrap()
                 .contains("authentication complete")
         );
+    }
+
+    #[test]
+    fn callback_port_conflict_falls_back_to_pasted_callback_url() {
+        let mut output = Vec::new();
+
+        let listener =
+            callback_listener_or_paste_only(Err(OpenAiCodexError::CallbackPortInUse), &mut output)
+                .unwrap();
+
+        assert!(listener.is_none());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("continuing with pasted redirect URL only")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_without_listener_completes_from_pasted_callback_url() {
+        let id_token = id_token("acct_auth", "plus");
+        let (base_url, requests) = spawn_test_server(vec![TestResponse::json(&token_json(
+            "access", "refresh", &id_token, 3600,
+        ))])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let mut output = SharedOutput::default();
+        let captured_output = output.clone();
+        let pasted_callback = Box::pin(async move {
+            let state = wait_for_state(&captured_output).await;
+            Ok(Some(format!(
+                "http://localhost:1455/auth/callback?state={state}&code=auth-code"
+            )))
+        });
+
+        authenticate_openai_codex_with_inputs(
+            &path,
+            &mut output,
+            &base_url,
+            false,
+            None,
+            pasted_callback,
+        )
+        .await
+        .unwrap();
+
+        let auth = read_auth_file(&path).unwrap();
+        let tokens = auth.openai_codex.unwrap().tokens.unwrap();
+        assert_eq!(tokens.access_token, "access");
+        assert_eq!(tokens.chatgpt_account_id, "acct_auth");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(
+            String::from_utf8(output.bytes())
+                .unwrap()
+                .contains("paste the full broken URL here")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_without_listener_fails_when_pasted_callback_is_eof() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let mut output = SharedOutput::default();
+        let pasted_callback = Box::pin(async { Ok(None) });
+
+        let error = authenticate_openai_codex_with_inputs(
+            &path,
+            &mut output,
+            "http://127.0.0.1:9",
+            false,
+            None,
+            pasted_callback,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OpenAiCodexError::Protocol(_)));
+        assert_eq!(
+            error.to_string(),
+            "failed to read pasted OpenAI Codex auth callback URL"
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn auth_with_listener_completes_when_pasted_callback_wins() {
+        let id_token = id_token("acct_auth", "plus");
+        let (base_url, requests) = spawn_test_server(vec![TestResponse::json(&token_json(
+            "access", "refresh", &id_token, 3600,
+        ))])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut output = SharedOutput::default();
+        let captured_output = output.clone();
+        let pasted_callback = Box::pin(async move {
+            let state = wait_for_state(&captured_output).await;
+            Ok(Some(format!(
+                "http://localhost:1455/auth/callback?state={state}&code=auth-code"
+            )))
+        });
+
+        authenticate_openai_codex_with_inputs(
+            &path,
+            &mut output,
+            &base_url,
+            false,
+            Some(listener),
+            pasted_callback,
+        )
+        .await
+        .unwrap();
+
+        let auth = read_auth_file(&path).unwrap();
+        let tokens = auth.openai_codex.unwrap().tokens.unwrap();
+        assert_eq!(tokens.access_token, "access");
+        assert_eq!(tokens.chatgpt_account_id, "acct_auth");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_with_listener_ignores_pasted_callback_eof() {
+        let id_token = id_token("acct_auth", "plus");
+        let (base_url, requests) = spawn_test_server(vec![TestResponse::json(&token_json(
+            "access", "refresh", &id_token, 3600,
+        ))])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let output = SharedOutput::default();
+        let captured_output = output.clone();
+        let pasted_callback = Box::pin(async { Ok(None) });
+
+        let auth_task = tokio::spawn(async move {
+            let mut output = output;
+            authenticate_openai_codex_with_inputs(
+                &path,
+                &mut output,
+                &base_url,
+                false,
+                Some(listener),
+                pasted_callback,
+            )
+            .await
+        });
+        let state = wait_for_state(&captured_output).await;
+
+        let ok = send_get(
+            addr,
+            &format!("/auth/callback?state={state}&code=auth-code"),
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"));
+        auth_task.await.unwrap().unwrap();
+
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_with_listener_finishes_accepted_callback_when_paste_finishes() {
+        let id_token = id_token("acct_auth", "plus");
+        let (base_url, requests) = spawn_test_server(vec![TestResponse::json(&token_json(
+            "access", "refresh", &id_token, 3600,
+        ))])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let output = SharedOutput::default();
+        let captured_output = output.clone();
+        let pasted_callback = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(None)
+        });
+
+        let auth_task = tokio::spawn(async move {
+            let mut output = output;
+            authenticate_openai_codex_with_inputs(
+                &path,
+                &mut output,
+                &base_url,
+                false,
+                Some(listener),
+                pasted_callback,
+            )
+            .await
+        });
+        let state = wait_for_state(&captured_output).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let raw = format!(
+            "GET /auth/callback?state={state}&code=auth-code HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+        );
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK")
+        );
+        auth_task.await.unwrap().unwrap();
+
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1944,6 +2368,47 @@ data: {"type":"response.completed"}"#;
     }
 
     #[tokio::test]
+    async fn pasted_callback_url_exchanges_and_persists_openai_codex_tokens() {
+        let id_token = id_token("acct_auth", "plus");
+        let (base_url, requests) = spawn_test_server(vec![TestResponse::json(&token_json(
+            "access", "refresh", &id_token, 3600,
+        ))])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let pkce = PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+
+        process_pasted_callback_url(
+            &path,
+            &base_url,
+            "expected-state",
+            &pkce,
+            "  http://localhost:1455/auth/callback?state=expected-state&code=auth-code\n",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        let auth = read_auth_file(&path).unwrap();
+        let tokens = auth.openai_codex.unwrap().tokens.unwrap();
+        assert_eq!(tokens.access_token, "access");
+        assert_eq!(tokens.refresh_token, "refresh");
+        assert_eq!(tokens.chatgpt_account_id, "acct_auth");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+        assert!(requests[0].contains("code=auth-code"));
+        assert!(requests[0].contains("code_verifier=verifier"));
+        assert!(
+            requests[0].contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback")
+        );
+        assert!(!requests[0].contains("client_secret"));
+    }
+
+    #[tokio::test]
     async fn non_callback_request_is_ignored_without_network() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("auth.toml");
@@ -1968,6 +2433,65 @@ data: {"type":"response.completed"}"#;
     }
 
     #[tokio::test]
+    async fn non_callback_pasted_url_is_rejected_without_network() {
+        let (base_url, requests) = spawn_test_server(Vec::new()).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let pkce = PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+
+        let error = process_pasted_callback_url(
+            &path,
+            &base_url,
+            "expected-state",
+            &pkce,
+            "http://localhost:1455/favicon.ico",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OpenAiCodexError::InvalidPastedCallbackUrl));
+        assert!(!path.exists());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pasted_callback_rejects_wrong_origin_without_network() {
+        let (base_url, requests) = spawn_test_server(Vec::new()).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let pkce = PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+
+        for pasted_url in [
+            "https://localhost:1455/auth/callback?state=expected-state&code=auth-code",
+            "http://127.0.0.1:1455/auth/callback?state=expected-state&code=auth-code",
+            "http://localhost:1456/auth/callback?state=expected-state&code=auth-code",
+        ] {
+            let error = process_pasted_callback_url(
+                &path,
+                &base_url,
+                "expected-state",
+                &pkce,
+                pasted_url,
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(error, OpenAiCodexError::InvalidPastedCallbackUrl));
+        }
+
+        assert!(!path.exists());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn state_mismatch_fails_without_persisting_tokens() {
         let (base_url, requests) = spawn_test_server(Vec::new()).await;
         let dir = tempdir().unwrap();
@@ -1983,6 +2507,32 @@ data: {"type":"response.completed"}"#;
             "expected-state",
             &pkce,
             "/auth/callback?state=wrong-state&code=auth-code",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OpenAiCodexError::StateMismatch));
+        assert!(!path.exists());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pasted_callback_state_mismatch_fails_without_persisting_tokens() {
+        let (base_url, requests) = spawn_test_server(Vec::new()).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let pkce = PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+
+        let error = process_pasted_callback_url(
+            &path,
+            &base_url,
+            "expected-state",
+            &pkce,
+            "http://localhost:1455/auth/callback?state=wrong-state&code=auth-code",
             &reqwest::Client::new(),
         )
         .await
@@ -2021,6 +2571,33 @@ data: {"type":"response.completed"}"#;
     }
 
     #[tokio::test]
+    async fn pasted_callback_missing_authorization_code_fails_without_persisting_tokens() {
+        let (base_url, requests) = spawn_test_server(Vec::new()).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let pkce = PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+
+        let error = process_pasted_callback_url(
+            &path,
+            &base_url,
+            "expected-state",
+            &pkce,
+            "http://localhost:1455/auth/callback?state=expected-state",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OpenAiCodexError::MissingAuthorizationCode));
+        assert!(callback_error_is_recoverable(&error));
+        assert!(!path.exists());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn oauth_error_callback_surfaces_error_without_persisting_tokens() {
         let (base_url, requests) = spawn_test_server(Vec::new()).await;
         let dir = tempdir().unwrap();
@@ -2036,6 +2613,35 @@ data: {"type":"response.completed"}"#;
             "expected-state",
             &pkce,
             "/auth/callback?state=expected-state&error=access_denied&error_description=nope",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "OpenAI Codex auth callback returned access_denied: nope"
+        );
+        assert!(!path.exists());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pasted_oauth_error_callback_surfaces_error_without_persisting_tokens() {
+        let (base_url, requests) = spawn_test_server(Vec::new()).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let pkce = PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+
+        let error = process_pasted_callback_url(
+            &path,
+            &base_url,
+            "expected-state",
+            &pkce,
+            "http://localhost:1455/auth/callback?state=expected-state&error=access_denied&error_description=nope",
             &reqwest::Client::new(),
         )
         .await
