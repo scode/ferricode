@@ -1,8 +1,7 @@
 use super::{ToolError, normalize_display_path, parse_tool_path, resolve_tool_path};
 use crate::ProviderRequest;
 use serde_json::{Value, json};
-use std::fs;
-use std::io::Read;
+use tokio::io::AsyncReadExt;
 
 const MAX_FILE_READ_BYTES: usize = 64 * 1024;
 
@@ -16,13 +15,20 @@ pub(super) const DEFINITION: super::ToolDefinition = super::ToolDefinition {
     name: "ferricode_read_file",
     description: "Read one UTF-8 text file under the request working directory.",
     parameters_schema: super::PATH_ARGUMENTS_SCHEMA,
-    run,
+    run: run_boxed,
 };
 
-pub(super) fn run(request: &ProviderRequest, arguments: &str) -> Result<Value, ToolError> {
+/// Adapts `run` to the registry's function-pointer signature by boxing its
+/// future; see `RunFn` in the parent module for why the box is needed.
+fn run_boxed<'a>(request: &'a ProviderRequest, arguments: &'a str) -> super::ToolFuture<'a> {
+    Box::pin(run(request, arguments))
+}
+
+/// Reads a bounded UTF-8 prefix without blocking the async executor.
+pub(super) async fn run(request: &ProviderRequest, arguments: &str) -> Result<Value, ToolError> {
     let path = parse_tool_path(arguments)?;
-    let resolved = resolve_tool_path(request.working_directory(), &path)?;
-    let metadata = fs::metadata(&resolved).map_err(|error| {
+    let resolved = resolve_tool_path(request.working_directory(), &path).await?;
+    let metadata = tokio::fs::metadata(&resolved).await.map_err(|error| {
         ToolError::new(format!("could not inspect `{}`: {error}", path.display()))
     })?;
     if !metadata.is_file() {
@@ -33,10 +39,12 @@ pub(super) fn run(request: &ProviderRequest, arguments: &str) -> Result<Value, T
     }
 
     let mut bytes = Vec::with_capacity(MAX_FILE_READ_BYTES + 4);
-    fs::File::open(&resolved)
+    tokio::fs::File::open(&resolved)
+        .await
         .map_err(|error| ToolError::new(format!("could not read `{}`: {error}", path.display())))?
         .take((MAX_FILE_READ_BYTES + 4) as u64)
         .read_to_end(&mut bytes)
+        .await
         .map_err(|error| ToolError::new(format!("could not read `{}`: {error}", path.display())))?;
 
     let truncated = bytes.len() > MAX_FILE_READ_BYTES;
