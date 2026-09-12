@@ -54,15 +54,33 @@ enum AuthCommand {
     OpenaiCodex,
 }
 
+/// Process entry point: owns the exit policy and nothing else.
+///
+/// Every failure prints its `Display` text behind an `error:` prefix, followed
+/// by the `source()` chain, and exits 1. Returning a `Result` from `main` would
+/// instead print the error's `Debug` form, which for a missing-auth run showed
+/// the struct wrapper around the message.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     init_tracing();
 
+    if let Err(error) = try_main().await {
+        eprintln!("error: {error}");
+        let mut source = error.source();
+        while let Some(cause) = source {
+            eprintln!("  caused by: {cause}");
+            source = cause.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Everything `main` does that can fail, so `?` stays usable.
+async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let provider = OpenAiCodexProvider::from_default_auth_path()?;
     let output = run(cli, &provider).await?;
     println!("{output}");
-
     Ok(())
 }
 
@@ -133,7 +151,9 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Parser};
-    use ferricode_core::{ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolOutput};
+    use ferricode_core::{
+        ModelProvider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderTurn, ToolOutput,
+    };
 
     struct StaticProvider;
 
@@ -180,6 +200,32 @@ mod tests {
             _tool_outputs: &'a [ToolOutput],
         ) -> Result<ProviderTurn<Self::State>, ProviderError> {
             unreachable!("unreachable test provider never requests tools")
+        }
+    }
+
+    /// Returns a classified auth failure so this test exercises the CLI's
+    /// message boundary without reading credentials or contacting a backend.
+    struct AuthRequiredProvider;
+
+    impl ModelProvider for AuthRequiredProvider {
+        type State = ();
+
+        async fn start<'a>(
+            &'a self,
+            _request: &'a ProviderRequest,
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            Err(ProviderError::new(
+                ProviderErrorKind::AuthRequired,
+                "authentication required",
+            ))
+        }
+
+        async fn resume<'a>(
+            &'a self,
+            _state: Self::State,
+            _tool_outputs: &'a [ToolOutput],
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            unreachable!("auth-required provider never requests tools")
         }
     }
 
@@ -254,6 +300,21 @@ mod tests {
                 .to_string()
                 .starts_with(&format!("working directory `{cwd}` is not usable"))
         );
+    }
+
+    /// `run` boxes provider errors into `Box<dyn Error>`; this guards that the
+    /// boxing never wraps or decorates the message, so what `main` prints is
+    /// the provider's own text. The `error:` prefix and exit code live in
+    /// `main` and are not exercised here.
+    #[tokio::test]
+    async fn provider_error_display_is_message_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cli = Cli::try_parse_from(["ferric", "run", "summarize task", "--cwd", cwd]).unwrap();
+
+        let error = super::run(cli, &AuthRequiredProvider).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "authentication required");
     }
 
     #[tokio::test]
