@@ -14,12 +14,12 @@ use crate::{
         CODEX_ORIGINATOR, DEFAULT_ISSUER, now_unix_ms, refresh_access_token, token_needs_refresh,
         tokens_from_response,
     },
-    sse::{parse_assistant_turn, parse_sse_assistant_stream},
+    sse::{parse_assistant_turn_with_sink, parse_sse_assistant_stream},
     store::{default_auth_path, read_auth_file, write_auth_file},
 };
 use ferricode_core::{
-    ModelProvider, ProviderError, ProviderErrorKind, ProviderFuture, ProviderRequest, ProviderTurn,
-    Transcript, TranscriptItem, built_in_tools,
+    HarnessEventSink, ModelProvider, NoopEventSink, ProviderError, ProviderErrorKind,
+    ProviderFuture, ProviderRequest, ProviderTurn, Transcript, TranscriptItem, built_in_tools,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
@@ -78,7 +78,7 @@ impl OpenAiCodexProvider {
     /// built-in tool calls can be executed.
     pub async fn respond(&self, request: &ProviderRequest) -> Result<String, ProviderError> {
         let transcript = Transcript::for_request(request);
-        match self.complete(request, &transcript).await? {
+        match self.complete(request, &transcript, &NoopEventSink).await? {
             ProviderTurn::Final { text, .. } => Ok(text),
             ProviderTurn::ToolCalls { .. } => Err(ProviderError::new(
                 ProviderErrorKind::Protocol,
@@ -126,13 +126,14 @@ impl ModelProvider for OpenAiCodexProvider {
         &'a self,
         request: &'a ProviderRequest,
         transcript: &'a Transcript,
+        sink: &'a dyn HarnessEventSink,
     ) -> ProviderFuture<'a> {
         Box::pin(async move {
             let tokens = self.authenticated_tokens().await?;
             let body = build_responses_body(request, transcript);
             log_request_item_counts(transcript);
             let turn = self
-                .send_responses_request(&tokens, &body)
+                .send_responses_request(&tokens, &body, sink)
                 .await
                 .map_err(ProviderError::from)?;
             tracing::debug!(output_item_types = ?turn_item_types(&turn), "received OpenAI Codex response items");
@@ -146,6 +147,7 @@ impl OpenAiCodexProvider {
         &self,
         tokens: &TokenSet,
         body: &Value,
+        sink: &dyn HarnessEventSink,
     ) -> Result<ProviderTurn, OpenAiCodexError> {
         let response = self
             .client
@@ -161,7 +163,7 @@ impl OpenAiCodexProvider {
             return Err(OpenAiCodexError::BackendStatus { status, body: text });
         }
 
-        read_assistant_response(response).await
+        read_assistant_response(response, sink).await
     }
 }
 
@@ -292,6 +294,7 @@ fn built_in_tool_schemas() -> Value {
 
 async fn read_assistant_response(
     mut response: reqwest::Response,
+    sink: &dyn HarnessEventSink,
 ) -> Result<ProviderTurn, OpenAiCodexError> {
     if !response
         .headers()
@@ -300,10 +303,10 @@ async fn read_assistant_response(
         .is_some_and(|value| value.starts_with("text/event-stream"))
     {
         let text = response.text().await?;
-        return parse_assistant_turn(&text);
+        return parse_assistant_turn_with_sink(&text, sink);
     }
 
-    parse_sse_assistant_stream(&mut response).await
+    parse_sse_assistant_stream(&mut response, sink).await
 }
 
 fn build_codex_headers(tokens: &TokenSet) -> Result<HeaderMap, OpenAiCodexError> {
@@ -469,7 +472,11 @@ mod tests {
         )));
 
         let turn = provider
-            .complete(&ProviderRequest::new("read it", "/repo"), &transcript)
+            .complete(
+                &ProviderRequest::new("read it", "/repo"),
+                &transcript,
+                &NoopEventSink,
+            )
             .await
             .unwrap();
 
@@ -508,8 +515,10 @@ mod tests {
         transcript.push(TranscriptItem::UserMessage {
             text: "Working directory: /repo\n\nread it".to_string(),
         });
-        let ProviderTurn::ToolCalls { items } =
-            provider.complete(&request, &transcript).await.unwrap()
+        let ProviderTurn::ToolCalls { items } = provider
+            .complete(&request, &transcript, &NoopEventSink)
+            .await
+            .unwrap()
         else {
             panic!("expected tool call turn");
         };
@@ -521,7 +530,10 @@ mod tests {
             "call_1",
             r#"{"ok":true,"path":"README.md","content":"hi","truncated":false}"#,
         )));
-        let turn = provider.complete(&request, &transcript).await.unwrap();
+        let turn = provider
+            .complete(&request, &transcript, &NoopEventSink)
+            .await
+            .unwrap();
 
         assert!(matches!(turn, ProviderTurn::Final { text, .. } if text == "done"));
         let requests = requests.lock().unwrap();

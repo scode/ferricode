@@ -1,9 +1,13 @@
 use clap::{Parser, Subcommand};
-use ferricode_core::{Harness, HarnessRequest, ModelProvider};
+use ferricode_core::{
+    Harness, HarnessEvent, HarnessEventSink, HarnessRequest, ModelProvider, NoopEventSink,
+};
 use ferricode_openai_codex::{OpenAiCodexProvider, authenticate_openai_codex, default_auth_path};
 use std::future::Future;
+use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -79,29 +83,116 @@ async fn main() {
 async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let provider = OpenAiCodexProvider::from_default_auth_path()?;
-    let output = run(cli, &provider).await?;
-    println!("{output}");
+    let mut stdout = std::io::stdout();
+    if let Some(output) = run_with_tui_output(cli, &provider, &mut stdout).await? {
+        println!("{output}");
+    }
     Ok(())
 }
 
 /// Runs a parsed CLI request and returns the text the process should print.
 ///
 /// Keeping this separate from `main` lets tests cover non-auth command behavior
-/// without spawning the binary or installing a tracing subscriber.
-async fn run(cli: Cli, provider: &dyn ModelProvider) -> Result<String, Box<dyn std::error::Error>> {
+/// without spawning the binary or installing a tracing subscriber. The `Tui`
+/// command returns `None` on purpose: its output has already been streamed to
+/// `tui_output` as it arrived, and returning the summary too would print the
+/// same text twice.
+async fn run_with_tui_output(
+    cli: Cli,
+    provider: &dyn ModelProvider,
+    tui_output: &mut (dyn Write + Send),
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     match cli.command {
-        Command::Auth { command } => run_auth(command).await,
+        Command::Auth { command } => Ok(Some(run_auth(command).await?)),
         Command::Run { prompt, cwd } => {
             let request = HarnessRequest::new(prompt, cwd)?;
-            let response = Harness::new().handle(&request, provider).await?;
+            let response = Harness::new()
+                .handle(&request, provider, &NoopEventSink)
+                .await?;
             info!(summary = response.summary(), "handled harness request");
-            Ok(response.summary().to_owned())
+            Ok(Some(response.summary().to_owned()))
         }
         Command::Tui { prompt, cwd } => {
             let request = HarnessRequest::new(prompt, cwd)?;
-            let response = ferricode_tui::launch(request, provider).await?;
+            let sink = TuiOutputSink::new(tui_output);
+            let response = ferricode_tui::launch(request, provider, &sink).await?;
             info!(summary = response.summary(), "handled tui harness request");
-            Ok(response.summary().to_owned())
+            Ok(None)
+        }
+    }
+}
+
+/// Runs a CLI command without retaining TUI event output for tests that only
+/// inspect the returned string.
+///
+/// The process entry point supplies stdout to `run_with_tui_output`; this
+/// wrapper exists so command tests that only inspect final CLI results do not
+/// need to own an irrelevant writer.
+#[cfg(test)]
+async fn run(cli: Cli, provider: &dyn ModelProvider) -> Result<String, Box<dyn std::error::Error>> {
+    let mut output = std::io::sink();
+    Ok(run_with_tui_output(cli, provider, &mut output)
+        .await?
+        .unwrap_or_default())
+}
+
+/// Writes the subset of harness events the bootstrap TUI can render today.
+///
+/// The mutex makes a borrowed writer compatible with the event sink's `Sync`
+/// contract. Write failures are intentionally ignored: an event sink is
+/// informational, so terminal output must not alter harness control flow.
+///
+/// Text is rendered from deltas as they arrive. The completion event's text is
+/// used only as a fallback: a provider that returns a turn without streaming
+/// any delta (a future non-streaming provider, or a backend variant that emits
+/// no text deltas) would otherwise leave the user staring at a blank line
+/// while `ferric run` printed the summary.
+struct TuiOutputSink<W> {
+    state: Mutex<TuiOutputState<W>>,
+}
+
+/// Writer plus the one bit of per-turn memory the fallback needs.
+struct TuiOutputState<W> {
+    writer: W,
+    saw_delta: bool,
+}
+
+impl<W> TuiOutputSink<W> {
+    /// Wraps a caller-owned writer so tests can observe TUI output safely.
+    fn new(writer: W) -> Self {
+        Self {
+            state: Mutex::new(TuiOutputState {
+                writer,
+                saw_delta: false,
+            }),
+        }
+    }
+}
+
+impl<W: Write + Send> HarnessEventSink for TuiOutputSink<W> {
+    fn on_event(&self, event: HarnessEvent) {
+        // A poisoned lock must not turn an informational sink into a panic through the harness.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match event {
+            HarnessEvent::AssistantTextDelta { text } => {
+                state.saw_delta = true;
+                let _ = state.writer.write_all(text.as_bytes());
+                let _ = state.writer.flush();
+            }
+            HarnessEvent::TurnFinished { text } => {
+                if !text.is_empty() {
+                    if !state.saw_delta {
+                        let _ = state.writer.write_all(text.as_bytes());
+                    }
+                    let _ = writeln!(state.writer);
+                    let _ = state.writer.flush();
+                }
+                state.saw_delta = false;
+            }
+            HarnessEvent::ToolCallStarted { .. } | HarnessEvent::ToolCallFinished { .. } => {}
         }
     }
 }
@@ -149,10 +240,12 @@ fn init_tracing() {
 mod tests {
     use super::{Cli, Parser};
     use ferricode_core::{
-        ModelProvider, ProviderError, ProviderErrorKind, ProviderFuture, ProviderRequest,
-        ProviderTurn, Transcript, TranscriptItem,
+        HarnessEvent, HarnessEventSink, ModelProvider, ProviderError, ProviderErrorKind,
+        ProviderFuture, ProviderRequest, ProviderTurn, Transcript, TranscriptItem,
     };
 
+    /// Supplies deterministic final text and one matching delta, allowing CLI
+    /// tests to exercise the same event contract a streaming provider uses.
     struct StaticProvider;
 
     impl ModelProvider for StaticProvider {
@@ -160,6 +253,7 @@ mod tests {
             &'a self,
             request: &'a ProviderRequest,
             _: &'a Transcript,
+            sink: &'a dyn HarnessEventSink,
         ) -> ProviderFuture<'a> {
             Box::pin(async move {
                 let text = format!(
@@ -167,6 +261,7 @@ mod tests {
                     request.working_directory().display(),
                     request.prompt()
                 );
+                sink.on_event(HarnessEvent::AssistantTextDelta { text: text.clone() });
                 Ok(ProviderTurn::Final {
                     items: vec![TranscriptItem::AssistantMessage { text: text.clone() }],
                     text,
@@ -180,7 +275,12 @@ mod tests {
     struct UnreachableProvider;
 
     impl ModelProvider for UnreachableProvider {
-        fn complete<'a>(&'a self, _: &'a ProviderRequest, _: &'a Transcript) -> ProviderFuture<'a> {
+        fn complete<'a>(
+            &'a self,
+            _: &'a ProviderRequest,
+            _: &'a Transcript,
+            _: &'a dyn HarnessEventSink,
+        ) -> ProviderFuture<'a> {
             Box::pin(async { panic!("provider must not be called for an invalid request") })
         }
     }
@@ -190,7 +290,12 @@ mod tests {
     struct AuthRequiredProvider;
 
     impl ModelProvider for AuthRequiredProvider {
-        fn complete<'a>(&'a self, _: &'a ProviderRequest, _: &'a Transcript) -> ProviderFuture<'a> {
+        fn complete<'a>(
+            &'a self,
+            _: &'a ProviderRequest,
+            _: &'a Transcript,
+            _: &'a dyn HarnessEventSink,
+        ) -> ProviderFuture<'a> {
             Box::pin(async {
                 Err(ProviderError::new(
                     ProviderErrorKind::AuthRequired,
@@ -236,23 +341,49 @@ mod tests {
         );
     }
 
-    /// The `tui` path builds the same validated request as `run`, so it sees the
-    /// canonical `--cwd` too.
+    /// The `tui` subcommand passes canonical `--cwd` through core and prints
+    /// streamed deltas without repeating the completed response summary.
     #[tokio::test]
     async fn tui_uses_core_request_contract() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let cli = Cli::try_parse_from(["ferric", "tui", "open screen", "--cwd", cwd]).unwrap();
 
-        let output = super::run(cli, &StaticProvider).await.unwrap();
+        let mut output = Vec::new();
+        let returned = super::run_with_tui_output(cli, &StaticProvider, &mut output)
+            .await
+            .unwrap();
 
         assert_eq!(
             output,
             format!(
-                "provider response from {}: open screen",
+                "provider response from {}: open screen\n",
                 dir.path().canonicalize().unwrap().display()
             )
+            .into_bytes()
         );
+        assert_eq!(returned, None);
+    }
+
+    /// The bootstrap TUI renders streamed text exactly once, making its writer
+    /// injectable instead of relying on process-global stdout in tests.
+    #[test]
+    fn tui_sink_writes_deltas_to_an_injected_writer() {
+        let mut output = Vec::new();
+        {
+            let sink = super::TuiOutputSink::new(&mut output);
+            sink.on_event(HarnessEvent::AssistantTextDelta {
+                text: "hel".to_string(),
+            });
+            sink.on_event(HarnessEvent::AssistantTextDelta {
+                text: "lo".to_string(),
+            });
+            sink.on_event(HarnessEvent::TurnFinished {
+                text: "hello".to_string(),
+            });
+        }
+
+        assert_eq!(output, b"hello\n");
     }
 
     /// A `--cwd` that does not exist fails before the provider is contacted,

@@ -5,9 +5,11 @@
 //! concrete model backend, but tool orchestration and local filesystem policy
 //! stay here so every front end gets the same behavior.
 
+mod events;
 mod tools;
 mod transcript;
 
+pub use events::{HarnessEvent, HarnessEventSink, NoopEventSink};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -207,16 +209,41 @@ pub enum ProviderTurn {
     },
 }
 
+impl ProviderTurn {
+    /// Returns the transcript entries this turn produced, whichever kind it is.
+    pub fn items(&self) -> &[TranscriptItem] {
+        match self {
+            Self::Final { items, .. } | Self::ToolCalls { items } => items,
+        }
+    }
+
+    /// Returns the assistant text of this turn: every `AssistantMessage` entry
+    /// concatenated in order, or an empty string when the turn produced none.
+    ///
+    /// This is the single definition of "what the model said this turn". Core
+    /// uses it for the completion event and providers use it to forward
+    /// buffered text, so the two never disagree.
+    pub fn assistant_text(&self) -> String {
+        self.items()
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::AssistantMessage { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// The boxed future used by the object-safe provider boundary.
 pub type ProviderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProviderTurn, ProviderError>> + Send + 'a>>;
 
 /// A provider that can drive one model interaction through core-owned tools.
 ///
-/// The core trait intentionally remains narrow. It does not expose streaming,
-/// model selection, provider fallback, or MCP. It only gives the harness enough
-/// structure to run local built-in tools and hand their outputs back to the
-/// same provider.
+/// The core trait intentionally remains narrow. It exposes progress only
+/// through the core-owned informational sink, rather than a provider streaming
+/// API, and otherwise gives the harness enough structure to run local built-in
+/// tools and hand their outputs back to the same provider.
 pub trait ModelProvider: Send + Sync {
     /// Renders the complete transcript and returns the next model turn.
     ///
@@ -228,6 +255,7 @@ pub trait ModelProvider: Send + Sync {
         &'a self,
         request: &'a ProviderRequest,
         transcript: &'a Transcript,
+        sink: &'a dyn HarnessEventSink,
     ) -> ProviderFuture<'a>;
 }
 
@@ -297,22 +325,31 @@ impl Harness {
         Self
     }
 
-    /// Handles a user request through the supplied provider.
+    /// Handles a user request through the supplied provider and progress sink.
     ///
     /// The harness stays responsible for orchestration, including built-in tool
     /// execution. Provider crates own only the backend-specific request and
-    /// response format needed to ask a model what to do next.
+    /// response format needed to ask a model what to do next. Every successful
+    /// provider turn receives a completion event before core validates,
+    /// records, or executes that turn, so a sink sees the model-turn boundary
+    /// independently of later harness policy.
     pub async fn handle(
         &self,
         request: &HarnessRequest,
         provider: &dyn ModelProvider,
+        sink: &dyn HarnessEventSink,
     ) -> Result<HarnessResponse, ProviderError> {
         let provider_request = ProviderRequest::new(request.prompt(), request.working_directory());
         let mut transcript = Transcript::for_request(&provider_request);
         let mut tool_turns = 0;
 
         loop {
-            let turn = provider.complete(&provider_request, &transcript).await?;
+            let turn = provider
+                .complete(&provider_request, &transcript, sink)
+                .await?;
+            sink.on_event(HarnessEvent::TurnFinished {
+                text: turn.assistant_text(),
+            });
             match turn {
                 ProviderTurn::Final { text, items } => {
                     if !items
@@ -329,6 +366,9 @@ impl Harness {
                 }
                 ProviderTurn::ToolCalls { items } => {
                     if tool_turns == MAX_TOOL_TURNS {
+                        // A harness policy limit, not a wire-shape problem, so
+                        // `Other` rather than `Protocol`; nothing about the
+                        // transport is broken.
                         return Err(ProviderError::new(
                             ProviderErrorKind::Other,
                             format!(
@@ -351,7 +391,7 @@ impl Harness {
                     }
                     tool_turns += 1;
                     transcript.extend(items);
-                    let outputs = execute_tool_calls(&provider_request, calls).await;
+                    let outputs = execute_tool_calls(&provider_request, calls, sink).await;
                     transcript.extend(outputs.into_iter().map(TranscriptItem::ToolResult));
                 }
             }
@@ -386,9 +426,9 @@ impl std::error::Error for HarnessError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Harness, HarnessError, HarnessRequest, ModelProvider, ProviderError, ProviderErrorKind,
-        ProviderFuture, ProviderRequest, ProviderTurn, ToolCall, ToolOutput, Transcript,
-        TranscriptItem,
+        Harness, HarnessError, HarnessEvent, HarnessEventSink, HarnessRequest, ModelProvider,
+        NoopEventSink, ProviderError, ProviderErrorKind, ProviderFuture, ProviderRequest,
+        ProviderTurn, ToolCall, ToolOutput, Transcript, TranscriptItem,
     };
     use serde_json::Value;
     use std::fs;
@@ -402,6 +442,7 @@ mod tests {
             &'a self,
             request: &'a ProviderRequest,
             _transcript: &'a Transcript,
+            _: &'a dyn HarnessEventSink,
         ) -> ProviderFuture<'a> {
             Box::pin(async move {
                 let text = format!(
@@ -424,6 +465,7 @@ mod tests {
             &'a self,
             _request: &'a ProviderRequest,
             _transcript: &'a Transcript,
+            _: &'a dyn HarnessEventSink,
         ) -> ProviderFuture<'a> {
             Box::pin(async {
                 Err(ProviderError::new(
@@ -448,11 +490,25 @@ mod tests {
         }
     }
 
+    /// Records informational events so event ordering can be asserted without
+    /// coupling the harness tests to a terminal implementation.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<HarnessEvent>>,
+    }
+
+    impl HarnessEventSink for RecordingSink {
+        fn on_event(&self, event: HarnessEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
     impl ModelProvider for ScriptedProvider {
         fn complete<'a>(
             &'a self,
             _request: &'a ProviderRequest,
             transcript: &'a Transcript,
+            sink: &'a dyn HarnessEventSink,
         ) -> ProviderFuture<'a> {
             Box::pin(async move {
                 let last_outputs = transcript
@@ -480,6 +536,9 @@ mod tests {
                         .collect();
                     Ok(ProviderTurn::ToolCalls { items })
                 } else {
+                    sink.on_event(HarnessEvent::AssistantTextDelta {
+                        text: "done".to_string(),
+                    });
                     Ok(ProviderTurn::Final {
                         text: "done".to_string(),
                         items: vec![TranscriptItem::AssistantMessage {
@@ -560,7 +619,10 @@ mod tests {
         let harness = Harness::new();
         let request = HarnessRequest::new("inspect failures", dir.path()).unwrap();
 
-        let response = harness.handle(&request, &EchoProvider).await.unwrap();
+        let response = harness
+            .handle(&request, &EchoProvider, &NoopEventSink)
+            .await
+            .unwrap();
 
         assert_eq!(
             response.summary(),
@@ -580,7 +642,7 @@ mod tests {
         let request = HarnessRequest::new("inspect failures", dir.path()).unwrap();
 
         let response = Harness::new()
-            .handle(&request, provider.as_ref())
+            .handle(&request, provider.as_ref(), &NoopEventSink)
             .await
             .unwrap();
 
@@ -593,7 +655,10 @@ mod tests {
         let harness = Harness::new();
         let request = HarnessRequest::new("summarize this repository", dir.path()).unwrap();
 
-        let response = harness.handle(&request, &EchoProvider).await.unwrap();
+        let response = harness
+            .handle(&request, &EchoProvider, &NoopEventSink)
+            .await
+            .unwrap();
 
         assert_eq!(
             response.summary(),
@@ -610,12 +675,94 @@ mod tests {
         let harness = Harness::new();
         let request = HarnessRequest::new("inspect failures", dir.path()).unwrap();
 
+        let sink = RecordingSink::default();
         let error = harness
-            .handle(&request, &FailingProvider)
+            .handle(&request, &FailingProvider, &sink)
             .await
             .unwrap_err();
 
         assert_eq!(error.to_string(), "provider failed");
+        // A provider that never produced a turn produced no completion event
+        // either; a sink must not see "turn finished" for a request that failed.
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    /// The regression the event design exists to prevent: a tool-call turn that
+    /// also carries assistant text must report that text in its completion
+    /// event, not an empty string, so a front end that renders per-turn text
+    /// sees what the model said before it called the tool.
+    #[tokio::test]
+    async fn turn_finished_carries_text_of_a_tool_call_turn() {
+        struct TextThenCallProvider;
+
+        impl ModelProvider for TextThenCallProvider {
+            fn complete<'a>(
+                &'a self,
+                _: &'a ProviderRequest,
+                transcript: &'a Transcript,
+                sink: &'a dyn HarnessEventSink,
+            ) -> ProviderFuture<'a> {
+                Box::pin(async move {
+                    let already_called = transcript
+                        .items()
+                        .iter()
+                        .any(|item| matches!(item, TranscriptItem::ToolResult(_)));
+                    if already_called {
+                        return Ok(ProviderTurn::Final {
+                            text: "done".to_string(),
+                            items: vec![TranscriptItem::AssistantMessage {
+                                text: "done".to_string(),
+                            }],
+                        });
+                    }
+                    sink.on_event(HarnessEvent::AssistantTextDelta {
+                        text: "looking".to_string(),
+                    });
+                    Ok(ProviderTurn::ToolCalls {
+                        items: vec![
+                            TranscriptItem::AssistantMessage {
+                                text: "looking".to_string(),
+                            },
+                            TranscriptItem::ToolCall(ToolCall::new(
+                                "list",
+                                "ferricode_list_directory",
+                                r#"{"path":"."}"#,
+                            )),
+                        ],
+                    })
+                })
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let request = HarnessRequest::new("inspect", dir.path()).unwrap();
+        let sink = RecordingSink::default();
+
+        Harness::new()
+            .handle(&request, &TextThenCallProvider, &sink)
+            .await
+            .unwrap();
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(
+            events[0],
+            HarnessEvent::AssistantTextDelta {
+                text: "looking".to_string()
+            }
+        );
+        assert_eq!(
+            events[1],
+            HarnessEvent::TurnFinished {
+                text: "looking".to_string()
+            }
+        );
+        assert!(matches!(events[2], HarnessEvent::ToolCallStarted { .. }));
+        assert_eq!(
+            *events.last().unwrap(),
+            HarnessEvent::TurnFinished {
+                text: "done".to_string()
+            }
+        );
     }
 
     /// A tool-call turn without a core tool call is malformed provider output,
@@ -629,6 +776,7 @@ mod tests {
                 &'a self,
                 _: &'a ProviderRequest,
                 _: &'a Transcript,
+                _: &'a dyn HarnessEventSink,
             ) -> ProviderFuture<'a> {
                 Box::pin(async {
                     Ok(ProviderTurn::ToolCalls {
@@ -645,7 +793,7 @@ mod tests {
         let request = HarnessRequest::new("inspect", dir.path()).unwrap();
 
         let error = Harness::new()
-            .handle(&request, &EmptyToolCallProvider)
+            .handle(&request, &EmptyToolCallProvider, &NoopEventSink)
             .await
             .unwrap_err();
 
@@ -674,7 +822,10 @@ mod tests {
         ]);
         let request = HarnessRequest::new("read project files", dir.path()).unwrap();
 
-        let response = Harness::new().handle(&request, &provider).await.unwrap();
+        let response = Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         assert_eq!(response.summary(), "done");
         let outputs = provider.outputs.lock().unwrap();
@@ -703,6 +854,44 @@ mod tests {
         ));
     }
 
+    /// Core completes every returned model turn before it runs that turn's
+    /// tools, while provider text remains in the model turn that produced it.
+    #[tokio::test]
+    async fn emits_tool_and_provider_events_in_request_order() {
+        let dir = tempdir().unwrap();
+        let call = ToolCall::new("unknown", "ferricode_unknown", "{}");
+        let provider = ScriptedProvider::new([vec![call.clone()]]);
+        let sink = RecordingSink::default();
+        let request = HarnessRequest::new("inspect", dir.path()).unwrap();
+
+        Harness::new()
+            .handle(&request, &provider, &sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            vec![
+                HarnessEvent::TurnFinished {
+                    text: String::new(),
+                },
+                HarnessEvent::ToolCallStarted { call },
+                HarnessEvent::ToolCallFinished {
+                    output: ToolOutput::new(
+                        "unknown",
+                        r#"{"error":"unknown built-in tool `ferricode_unknown`","ok":false}"#,
+                    ),
+                },
+                HarnessEvent::AssistantTextDelta {
+                    text: "done".to_string(),
+                },
+                HarnessEvent::TurnFinished {
+                    text: "done".to_string(),
+                },
+            ]
+        );
+    }
+
     /// Foreign opaque entries are conversation data, not core policy. This
     /// proves core preserves them for a later provider to decide whether it can
     /// consume them instead of silently discarding state it cannot understand.
@@ -714,6 +903,7 @@ mod tests {
                 &'a self,
                 _: &'a ProviderRequest,
                 transcript: &'a Transcript,
+                _: &'a dyn HarnessEventSink,
             ) -> ProviderFuture<'a> {
                 Box::pin(async move {
                     if transcript
@@ -766,7 +956,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let request = HarnessRequest::new("inspect", dir.path()).unwrap();
         let response = Harness::new()
-            .handle(&request, &OpaqueProvider)
+            .handle(&request, &OpaqueProvider, &NoopEventSink)
             .await
             .unwrap();
 
@@ -787,6 +977,7 @@ mod tests {
                 &'a self,
                 _: &'a ProviderRequest,
                 _: &'a Transcript,
+                _: &'a dyn HarnessEventSink,
             ) -> ProviderFuture<'a> {
                 Box::pin(async {
                     Ok(ProviderTurn::Final {
@@ -803,8 +994,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let request = HarnessRequest::new("inspect", dir.path()).unwrap();
 
+        let sink = RecordingSink::default();
         let error = Harness::new()
-            .handle(&request, &OpaqueFinalProvider)
+            .handle(&request, &OpaqueFinalProvider, &sink)
             .await
             .unwrap_err();
 
@@ -812,6 +1004,14 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "provider returned a final turn with no assistant message"
+        );
+        // The model did finish a turn, so its completion event still fires (with
+        // no text) even though core then rejects the turn as malformed.
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            vec![HarnessEvent::TurnFinished {
+                text: String::new()
+            }]
         );
     }
 
@@ -832,7 +1032,10 @@ mod tests {
         let provider = ScriptedProvider::new(calls);
         let request = HarnessRequest::new("loop", dir.path()).unwrap();
 
-        let response = Harness::new().handle(&request, &provider).await.unwrap();
+        let response = Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         assert_eq!(response.summary(), "done");
         assert_eq!(provider.outputs.lock().unwrap().len(), 32);
@@ -855,7 +1058,7 @@ mod tests {
         let request = HarnessRequest::new("loop", dir.path()).unwrap();
 
         let error = Harness::new()
-            .handle(&request, &provider)
+            .handle(&request, &provider, &NoopEventSink)
             .await
             .unwrap_err();
 
@@ -881,7 +1084,10 @@ mod tests {
         )]]);
         let request = HarnessRequest::new("list", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let listed = parse_output(&outputs[0][0]);
@@ -909,7 +1115,10 @@ mod tests {
         )]]);
         let request = HarnessRequest::new("list", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let listed = parse_output(&outputs[0][0]);
@@ -930,7 +1139,10 @@ mod tests {
         )]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let read = parse_output(&outputs[0][0]);
@@ -953,7 +1165,10 @@ mod tests {
         )]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let read = parse_output(&outputs[0][0]);
@@ -976,7 +1191,10 @@ mod tests {
         )]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let read = parse_output(&outputs[0][0]);
@@ -997,7 +1215,10 @@ mod tests {
         )]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let read = parse_output(&outputs[0][0]);
@@ -1017,7 +1238,10 @@ mod tests {
         )]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let read = parse_output(&outputs[0][0]);
@@ -1051,7 +1275,10 @@ mod tests {
         let provider = ScriptedProvider::new([calls]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         for output in &outputs[0] {
@@ -1099,7 +1326,10 @@ mod tests {
         let provider = ScriptedProvider::new([calls]);
         let request = HarnessRequest::new("list", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         for output in &outputs[0] {
@@ -1141,7 +1371,10 @@ mod tests {
         let provider = ScriptedProvider::new([calls]);
         let request = HarnessRequest::new("list", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         assert_eq!(outputs[0].len(), 17);
@@ -1168,7 +1401,10 @@ mod tests {
         ]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         assert_eq!(outputs[0].len(), 3);
@@ -1208,7 +1444,10 @@ mod tests {
         ]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
-        Harness::new().handle(&request, &provider).await.unwrap();
+        Harness::new()
+            .handle(&request, &provider, &NoopEventSink)
+            .await
+            .unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
         let errors = outputs[0].iter().map(parse_output).collect::<Vec<_>>();
