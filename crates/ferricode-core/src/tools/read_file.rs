@@ -6,6 +6,19 @@ use std::io::Read;
 
 const MAX_FILE_READ_BYTES: usize = 64 * 1024;
 
+/// Registry entry for the file-reading tool.
+///
+/// `name` is the wire-facing identifier documented in `docs/tools.md`;
+/// renaming it is a model-integration change, and `run` below is reachable
+/// only through it. The schema is what the model is told about the arguments,
+/// not what is enforced: `parse_tool_path` still validates the path itself.
+pub(super) const DEFINITION: super::ToolDefinition = super::ToolDefinition {
+    name: "ferricode_read_file",
+    description: "Read one UTF-8 text file under the request working directory.",
+    parameters_schema: super::PATH_ARGUMENTS_SCHEMA,
+    run,
+};
+
 pub(super) fn run(request: &ProviderRequest, arguments: &str) -> Result<Value, ToolError> {
     let path = parse_tool_path(arguments)?;
     let resolved = resolve_tool_path(request.working_directory(), &path)?;
