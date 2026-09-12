@@ -32,7 +32,6 @@ const CODEX_BACKEND_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex
 /// SPEC.md names this model too and must stay in sync.
 const MODEL: &str = "gpt-6-astra";
 const REASONING_EFFORT: &str = "medium";
-const INSTRUCTIONS: &str = "You are Ferricode, a coding harness. Use the built-in filesystem tools when the user's request requires repository context. Start with a directory listing when you need to understand the working directory, then read specific relevant text files. Do not ask for clarification when the request can be handled by inspecting files.";
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCodexProvider {
@@ -130,12 +129,11 @@ impl ModelProvider for OpenAiCodexProvider {
     ) -> Result<ProviderTurn<Self::State>, ProviderError> {
         let tokens = self.authenticated_tokens().await?;
         let body = build_responses_body(request);
-        let input_items = response_input_items(&body);
         let turn = self
             .send_responses_request(&tokens, &body)
             .await
             .map_err(ProviderError::from)?;
-        Ok(attach_input_items(turn, input_items))
+        Ok(attach_request_context(turn, &body))
     }
 
     async fn resume<'a>(
@@ -145,12 +143,11 @@ impl ModelProvider for OpenAiCodexProvider {
     ) -> Result<ProviderTurn<Self::State>, ProviderError> {
         let tokens = self.authenticated_tokens().await?;
         let body = build_tool_outputs_body(state, tool_outputs);
-        let input_items = response_input_items(&body);
         let turn = self
             .send_responses_request(&tokens, &body)
             .await
             .map_err(ProviderError::from)?;
-        Ok(attach_input_items(turn, input_items))
+        Ok(attach_request_context(turn, &body))
     }
 }
 
@@ -179,17 +176,23 @@ impl OpenAiCodexProvider {
 }
 
 /// OpenAI response output items needed to resume after tool execution.
+///
+/// `instructions` rides along because `resume` receives no request and each
+/// continuation is a fresh stateless request (`"store": false`) that must
+/// restate the system prompt itself; the harness owns that prompt
+/// (`ProviderRequest::instructions`) and this provider only relays it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenAiCodexState {
     pub(crate) input_items: Vec<Value>,
     pub(crate) output_items: Vec<Value>,
+    pub(crate) instructions: String,
 }
 
 /// Builds the hardcoded bootstrap Responses body.
 pub fn build_responses_body(request: &ProviderRequest) -> Value {
     json!({
         "model": MODEL,
-        "instructions": INSTRUCTIONS,
+        "instructions": request.instructions(),
         "stream": true,
         "input": [
             {
@@ -225,7 +228,7 @@ fn build_tool_outputs_body(state: OpenAiCodexState, tool_outputs: &[ToolOutput])
 
     json!({
         "model": MODEL,
-        "instructions": INSTRUCTIONS,
+        "instructions": state.instructions,
         "stream": true,
         "input": input,
         "tools": built_in_tool_schemas(),
@@ -245,13 +248,27 @@ fn response_input_items(body: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn attach_input_items(
+/// Copies what the next request must repeat (the input items sent so far and
+/// the system prompt) from the body just sent into the resume state.
+///
+/// The parser that produced `turn` only sees the response, so it cannot know
+/// what was asked; reading both values back from the request body keeps a
+/// single source of truth for what the backend has been told.
+fn attach_request_context(
     turn: ProviderTurn<OpenAiCodexState>,
-    input_items: Vec<Value>,
+    body: &Value,
 ) -> ProviderTurn<OpenAiCodexState> {
     match turn {
         ProviderTurn::ToolCalls { mut state, calls } => {
-            state.input_items = input_items;
+            state.input_items = response_input_items(body);
+            // Every body is built by this module, so a missing key is a bug;
+            // falling back to "" would send a request with no system prompt
+            // and nothing would notice, which is the failure this field exists
+            // to rule out.
+            state.instructions = body["instructions"]
+                .as_str()
+                .expect("request bodies built by this module always carry instructions")
+                .to_string();
             ProviderTurn::ToolCalls { state, calls }
         }
         ProviderTurn::Final(text) => ProviderTurn::Final(text),
@@ -339,7 +356,7 @@ mod tests {
         let body = build_responses_body(&request);
 
         assert_eq!(body["model"], MODEL);
-        assert_eq!(body["instructions"], INSTRUCTIONS);
+        assert_eq!(body["instructions"], ferricode_core::DEFAULT_INSTRUCTIONS);
         assert!(body["instructions"].as_str().unwrap().contains("inspect"));
         assert!(
             body["instructions"]
@@ -375,6 +392,7 @@ mod tests {
     #[test]
     fn tool_outputs_body_preserves_prior_items() {
         let state = OpenAiCodexState {
+            instructions: ferricode_core::DEFAULT_INSTRUCTIONS.to_string(),
             input_items: vec![json!({
                 "role": "user",
                 "content": [{"type": "input_text", "text": "Working directory: /repo\n\nread it"}]
@@ -402,6 +420,7 @@ mod tests {
         assert_eq!(body["input"][2]["call_id"], "call_1");
         assert_eq!(body["input"][2]["output"], outputs[0].output());
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["instructions"], ferricode_core::DEFAULT_INSTRUCTIONS);
     }
 
     #[tokio::test]
@@ -420,6 +439,7 @@ mod tests {
         let provider =
             OpenAiCodexProvider::with_urls(&path, &base_url, format!("{base_url}/codex/responses"));
         let state = OpenAiCodexState {
+            instructions: ferricode_core::DEFAULT_INSTRUCTIONS.to_string(),
             input_items: vec![json!({
                 "role": "user",
                 "content": [{"type": "input_text", "text": "Working directory: /repo\n\nread it"}]
@@ -486,6 +506,9 @@ mod tests {
         assert!(requests[1].contains("Working directory: /repo"));
         assert!(requests[1].contains("read it"));
         assert!(requests[1].contains(r#""type":"function_call_output""#));
+        // The resume request must repeat the system prompt the first turn sent,
+        // not a placeholder; only `attach_request_context` carries it across.
+        assert!(requests[1].contains(ferricode_core::DEFAULT_INSTRUCTIONS));
     }
 
     #[tokio::test]

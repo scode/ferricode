@@ -13,6 +13,14 @@ pub use tools::{ToolCall, ToolDefinition, ToolOutput, built_in_tools};
 
 const MAX_TOOL_TURNS: usize = 32;
 
+/// The system prompt sent with every model request.
+///
+/// It says what the agent is and how it should use the built-in tools, so it
+/// is harness policy rather than provider configuration: core owns the
+/// wording and providers relay it verbatim (`ProviderRequest::instructions`).
+/// Changing this text changes model behavior on every request.
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Ferricode, a coding harness. Use the built-in filesystem tools when the user's request requires repository context. Start with a directory listing when you need to understand the working directory, then read specific relevant text files. Do not ask for clarification when the request can be handled by inspecting files.";
+
 /// The user request and working directory context supplied to the harness.
 ///
 /// This type is intentionally UI-neutral. Callers may collect the prompt from a
@@ -91,26 +99,39 @@ impl HarnessRequest {
 pub struct ProviderRequest {
     prompt: String,
     working_directory: PathBuf,
+    instructions: &'static str,
 }
 
 impl ProviderRequest {
     /// Builds the narrow request a provider needs to produce assistant text.
     ///
-    /// This constructor does not validate the directory; the harness has
-    /// already done that when it built the `HarnessRequest`. Tests and other
-    /// direct callers may pass any path, but tools fail containment on any
-    /// root that is not the canonical absolute form (relative, symlinked, or
-    /// containing `..`), not only on one that does not exist.
+    /// The system prompt is always `DEFAULT_INSTRUCTIONS`; there is no way for a
+    /// caller to substitute one, because the prompt is harness policy rather
+    /// than a per-request choice. (`DEFAULT_` anticipates a later per-run
+    /// override, for example from a TUI setting; none exists today.) This
+    /// constructor does not validate the
+    /// directory; the harness has already done that when it built the
+    /// `HarnessRequest`. Tests and other direct callers may pass any path, but
+    /// tools fail containment on any root that is not the canonical absolute
+    /// form (relative, symlinked, or containing `..`), not only on one that
+    /// does not exist.
     pub fn new(prompt: impl Into<String>, working_directory: impl Into<PathBuf>) -> Self {
         Self {
             prompt: prompt.into(),
             working_directory: working_directory.into(),
+            instructions: DEFAULT_INSTRUCTIONS,
         }
     }
 
     /// Returns the prompt text selected by the harness for the provider.
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// Returns the system prompt the provider must send verbatim with the
+    /// request. Providers relay it; they do not compose their own.
+    pub fn instructions(&self) -> &'static str {
+        self.instructions
     }
 
     /// Returns the working directory the harness resolved, which tools treat as
