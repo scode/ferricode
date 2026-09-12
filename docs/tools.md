@@ -18,6 +18,10 @@ or future extension points without accidental collisions.
 Tool names are part of the provider-facing contract. Renaming one is a model-integration change, not just an internal
 Rust refactor.
 
+`ferricode-core` owns each built-in tool's name, description, and argument schema. Provider crates only translate those
+definitions into their wire format. Adding or renaming a tool therefore touches core and this document; provider crates
+need no code change, though their tests that pin the published tool list will.
+
 The current built-in tool names are:
 
 - `ferricode_list_directory`

@@ -8,7 +8,7 @@
 mod tools;
 
 use tools::execute_tool_calls;
-pub use tools::{ToolCall, ToolOutput};
+pub use tools::{ToolCall, ToolDefinition, ToolOutput, built_in_tools};
 
 const MAX_TOOL_TURNS: usize = 32;
 

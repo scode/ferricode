@@ -1,8 +1,10 @@
-//! Built-in tool interfaces and execution policy.
+//! Built-in tool definitions, interfaces, and execution policy.
 //!
 //! Providers expose these tools to a model, but they do not implement them.
 //! Keeping execution here gives every front end and provider the same local
 //! filesystem policy, output shape, and failure behavior.
+//! This module is the single source of truth for the definitions that providers
+//! translate into their wire formats.
 
 mod list_directory;
 mod read_file;
@@ -11,6 +13,73 @@ use crate::ProviderRequest;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+/// Argument schema shared by the filesystem tools: one relative `path` string
+/// and nothing else.
+///
+/// `additionalProperties: false` and listing every property under `required`
+/// are not stylistic: the OpenAI Codex provider sends these schemas with
+/// `strict: true`, and OpenAI strict function calling rejects schemas that
+/// leave either out. Any new tool schema has to keep both.
+pub(super) const PATH_ARGUMENTS_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "A relative path under the request working directory."
+    }
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}"#;
+
+/// The entry point of one built-in tool: JSON argument text in, tool JSON or a
+/// model-facing error out.
+type RunFn = fn(&ProviderRequest, &str) -> Result<Value, ToolError>;
+
+/// Provider-neutral description of one built-in tool: what it is called, what
+/// the model should read to decide when to use it, the JSON Schema of its
+/// arguments, and the function that runs it.
+///
+/// This struct is the whole registry. `built_in_tools()` is the only list of
+/// tools in the codebase, and dispatch in `execute_tool_call` walks it, so a
+/// tool that is published is always runnable and a tool that is runnable is
+/// always published. The `run` field is private so providers see only the
+/// wire-facing half.
+#[derive(Debug, Clone)]
+pub struct ToolDefinition {
+    name: &'static str,
+    description: &'static str,
+    parameters_schema: &'static str,
+    run: RunFn,
+}
+
+impl ToolDefinition {
+    /// Returns the stable provider-facing name of this built-in tool.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Returns the model-facing guidance for when this tool should be used.
+    pub fn description(&self) -> &'static str {
+        self.description
+    }
+
+    /// Parses this built-in tool's JSON Schema object.
+    ///
+    /// The schema is a core constant, so malformed text indicates a programming
+    /// error rather than caller input. Tests cover the constants to keep this
+    /// provider-facing contract intact.
+    pub fn parameters_schema(&self) -> Value {
+        serde_json::from_str(self.parameters_schema)
+            .expect("built-in tool parameter schema must be valid JSON")
+    }
+}
+
+/// Returns the built-in tools core will execute, in stable provider-facing order.
+pub fn built_in_tools() -> &'static [ToolDefinition] {
+    &[list_directory::DEFINITION, read_file::DEFINITION]
+}
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 16;
 const MAX_TOOL_CALL_ID_BYTES: usize = 256;
@@ -134,10 +203,15 @@ fn execute_tool_call(request: &ProviderRequest, call: &ToolCall) -> String {
         ));
     }
 
-    let output = match call.name.as_str() {
-        "ferricode_list_directory" => list_directory::run(request, &call.arguments),
-        "ferricode_read_file" => read_file::run(request, &call.arguments),
-        name => Err(ToolError::new(format!("unknown built-in tool `{name}`"))),
+    let output = match built_in_tools()
+        .iter()
+        .find(|definition| definition.name == call.name)
+    {
+        Some(definition) => (definition.run)(request, &call.arguments),
+        None => Err(ToolError::new(format!(
+            "unknown built-in tool `{}`",
+            call.name
+        ))),
     };
 
     match output {
@@ -223,6 +297,59 @@ impl ToolError {
     pub(super) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every published schema must be an object with `additionalProperties`
+    /// false and every property listed as required, because the OpenAI Codex
+    /// provider sends them under `strict: true` and the backend rejects
+    /// anything looser. This is the table-wide invariant; the per-tool shape
+    /// is checked separately below.
+    #[test]
+    fn built_in_schemas_satisfy_strict_function_calling() {
+        for definition in built_in_tools() {
+            let schema = definition.parameters_schema();
+            let properties = schema["properties"].as_object().unwrap();
+            let required = schema["required"].as_array().unwrap();
+
+            assert_eq!(schema["type"], "object", "{}", definition.name());
+            assert_eq!(
+                schema["additionalProperties"],
+                false,
+                "{}",
+                definition.name()
+            );
+            assert_eq!(required.len(), properties.len(), "{}", definition.name());
+            for property in properties.keys() {
+                assert!(
+                    required.iter().any(|value| value == property),
+                    "{}: `{property}` is not required",
+                    definition.name()
+                );
+            }
+        }
+    }
+
+    /// The two filesystem tools take exactly one relative `path` string; this
+    /// pins that shape per tool so a later tool with different arguments does
+    /// not have to weaken a table-wide test.
+    #[test]
+    fn filesystem_tools_take_a_single_path_argument() {
+        for definition in [&list_directory::DEFINITION, &read_file::DEFINITION] {
+            let schema = definition.parameters_schema();
+
+            assert_eq!(schema["required"], json!(["path"]), "{}", definition.name());
+            assert_eq!(
+                schema["properties"]["path"]["type"],
+                "string",
+                "{}",
+                definition.name()
+            );
         }
     }
 }

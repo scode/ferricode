@@ -4,9 +4,9 @@
 //! backend protocol. It builds fixed request shapes and decides when stored
 //! tokens need refreshing and persists the result, but leaves OAuth callback
 //! validation and the token endpoint itself to `auth` and parses backend output
-//! through `sse`. The tool schemas it sends are hard-coded in
-//! `built_in_tool_schemas`; this module does not consult a tool registry or
-//! decide tool policy.
+//! through `sse`. The tool schemas it sends are translated from the
+//! definitions `ferricode-core` publishes; this module does not decide tool
+//! policy.
 
 use crate::{
     OpenAiCodexError, TokenSet,
@@ -17,7 +17,9 @@ use crate::{
     sse::{parse_assistant_turn, parse_sse_assistant_stream},
     store::{default_auth_path, read_auth_file, write_auth_file},
 };
-use ferricode_core::{ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolOutput};
+use ferricode_core::{
+    ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolOutput, built_in_tools,
+};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -262,42 +264,20 @@ fn strip_provider_item_ids(mut item: Value) -> Value {
 }
 
 fn built_in_tool_schemas() -> Value {
-    json!([
-        {
-            "type": "function",
-            "name": "ferricode_list_directory",
-            "description": "List one directory under the request working directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "A relative path under the request working directory."
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            },
-            "strict": true
-        },
-        {
-            "type": "function",
-            "name": "ferricode_read_file",
-            "description": "Read one UTF-8 text file under the request working directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "A relative path under the request working directory."
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            },
-            "strict": true
-        }
-    ])
+    Value::Array(
+        built_in_tools()
+            .iter()
+            .map(|definition| {
+                json!({
+                    "type": "function",
+                    "name": definition.name(),
+                    "description": definition.description(),
+                    "parameters": definition.parameters_schema(),
+                    "strict": true
+                })
+            })
+            .collect(),
+    )
 }
 
 async fn read_assistant_response(
