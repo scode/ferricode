@@ -146,7 +146,7 @@ mod tests {
         ) -> Result<ProviderTurn<Self::State>, ProviderError> {
             Ok(ProviderTurn::Final(format!(
                 "provider response from {}: {}",
-                request.working_directory(),
+                request.working_directory().display(),
                 request.prompt()
             )))
         }
@@ -160,32 +160,100 @@ mod tests {
         }
     }
 
+    /// A provider that must never be reached; used to prove that request
+    /// validation happens before any model call.
+    struct UnreachableProvider;
+
+    impl ModelProvider for UnreachableProvider {
+        type State = ();
+
+        async fn start<'a>(
+            &'a self,
+            _request: &'a ProviderRequest,
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            panic!("provider must not be called for an invalid request")
+        }
+
+        async fn resume<'a>(
+            &'a self,
+            _state: Self::State,
+            _tool_outputs: &'a [ToolOutput],
+        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
+            unreachable!("unreachable test provider never requests tools")
+        }
+    }
+
+    /// The default `--cwd` is `.`, which the harness resolves to the process's
+    /// canonical current directory before the provider sees it.
     #[tokio::test]
     async fn run_uses_default_cwd() {
         let cli = Cli::try_parse_from(["ferric", "run", "summarize task"]).unwrap();
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
 
         let output = super::run(cli, &StaticProvider).await.unwrap();
 
-        assert_eq!(output, "provider response from .: summarize task");
+        assert_eq!(
+            output,
+            format!(
+                "provider response from {}: summarize task",
+                expected.display()
+            )
+        );
     }
 
+    /// An explicit `--cwd` reaches the provider in canonical form, not as typed.
     #[tokio::test]
     async fn run_uses_explicit_cwd() {
-        let cli =
-            Cli::try_parse_from(["ferric", "run", "summarize task", "--cwd", "/work"]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cli = Cli::try_parse_from(["ferric", "run", "summarize task", "--cwd", cwd]).unwrap();
 
         let output = super::run(cli, &StaticProvider).await.unwrap();
 
-        assert_eq!(output, "provider response from /work: summarize task");
+        assert_eq!(
+            output,
+            format!(
+                "provider response from {}: summarize task",
+                dir.path().canonicalize().unwrap().display()
+            )
+        );
     }
 
+    /// The `tui` path builds the same validated request as `run`, so it sees the
+    /// canonical `--cwd` too.
     #[tokio::test]
     async fn tui_uses_core_request_contract() {
-        let cli = Cli::try_parse_from(["ferric", "tui", "open screen", "--cwd", "/work"]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cli = Cli::try_parse_from(["ferric", "tui", "open screen", "--cwd", cwd]).unwrap();
 
         let output = super::run(cli, &StaticProvider).await.unwrap();
 
-        assert_eq!(output, "provider response from /work: open screen");
+        assert_eq!(
+            output,
+            format!(
+                "provider response from {}: open screen",
+                dir.path().canonicalize().unwrap().display()
+            )
+        );
+    }
+
+    /// A `--cwd` that does not exist fails before the provider is contacted,
+    /// with a message that names the path the user typed.
+    #[tokio::test]
+    async fn missing_cwd_fails_before_provider_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let cwd = missing.to_str().unwrap();
+        let cli = Cli::try_parse_from(["ferric", "run", "summarize task", "--cwd", cwd]).unwrap();
+
+        let error = super::run(cli, &UnreachableProvider).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("working directory `{cwd}` is not usable"))
+        );
     }
 
     #[tokio::test]

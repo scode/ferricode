@@ -195,7 +195,7 @@ pub fn build_responses_body(request: &ProviderRequest) -> Value {
                 "content": [
                     {
                         "type": "input_text",
-                        "text": format!("Working directory: {}\n\n{}", request.working_directory(), request.prompt())
+                        "text": format!("Working directory: {}\n\n{}", request.working_directory().display(), request.prompt())
                     }
                 ]
             }

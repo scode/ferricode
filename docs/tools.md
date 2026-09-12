@@ -37,7 +37,8 @@ shape:
 ```
 
 Paths are relative to the request working directory. For `ferric run`, that is the `--cwd` value, or `.` when no `--cwd`
-is provided.
+is provided. The working directory is resolved to its canonical form and must exist and be a directory; otherwise the
+command fails before contacting the model.
 
 Ferricode also caps the size of one tool call before execution. The provider call id and tool name must each fit within
 256 bytes, and the argument string must fit within 16 KiB. Calls outside those limits are returned to the model as tool

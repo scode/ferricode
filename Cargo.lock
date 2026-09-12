@@ -303,6 +303,7 @@ dependencies = [
  "ferricode-core",
  "ferricode-openai-codex",
  "ferricode-tui",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -293,21 +293,19 @@ pub(super) fn parse_tool_path(arguments: &str) -> Result<PathBuf, ToolError> {
 /// Resolves a relative tool path and rejects targets outside the working directory.
 ///
 /// `parse_tool_path` only checks the lexical form. A symlink under the root
-/// can still point anywhere, so both the root and the joined path are
-/// canonicalized (following symlinks) and the result must still sit under the
-/// root. The path must exist: canonicalization of a missing target fails, and
-/// that failure is reported to the model as a tool error.
+/// can still point anywhere, so the joined path is canonicalized (following
+/// symlinks) and the result must still sit under `root`. `root` must already
+/// be canonical; the harness guarantees that through `HarnessRequest::new`,
+/// and the comparison is only sound when both sides are canonical. The path
+/// must exist: canonicalization of a missing target fails, and that failure is
+/// reported to the model as a tool error.
 pub(super) async fn resolve_tool_path(
-    working_directory: &str,
+    root: &Path,
     relative_path: &Path,
 ) -> Result<PathBuf, ToolError> {
-    let root = tokio::fs::canonicalize(working_directory)
-        .await
-        .map_err(|error| {
-            ToolError::new(format!(
-                "could not resolve working directory `{working_directory}`: {error}"
-            ))
-        })?;
+    // Not re-canonicalizing the root is deliberate; a caller that builds a
+    // `ProviderRequest` with a non-canonical root gets containment failures
+    // on every call, never silent escapes.
     let resolved = tokio::fs::canonicalize(root.join(relative_path))
         .await
         .map_err(|error| {
@@ -316,7 +314,7 @@ pub(super) async fn resolve_tool_path(
                 relative_path.display()
             ))
         })?;
-    if !resolved.starts_with(&root) {
+    if !resolved.starts_with(root) {
         return Err(ToolError::new(
             "tool path resolved outside the working directory",
         ));

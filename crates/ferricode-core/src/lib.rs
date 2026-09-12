@@ -7,6 +7,7 @@
 
 mod tools;
 
+use std::path::{Path, PathBuf};
 use tools::execute_tool_calls;
 pub use tools::{ToolCall, ToolDefinition, ToolOutput, built_in_tools};
 
@@ -20,29 +21,52 @@ const MAX_TOOL_TURNS: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessRequest {
     prompt: String,
-    working_directory: String,
+    working_directory: PathBuf,
 }
 
 impl HarnessRequest {
-    /// Builds a request from caller-owned text.
+    /// Builds a request from caller-owned text and a directory that must exist.
     ///
     /// Empty prompts are rejected here rather than in the CLI or TUI so every
-    /// front end gets the same contract. The working directory remains a string
-    /// at this boundary because callers may only be passing context; local tool
-    /// execution resolves and validates it later, when filesystem access is
-    /// actually required.
+    /// front end gets the same contract. The working directory is resolved to
+    /// its canonical absolute form here too, and a path that does not exist or
+    /// is not a directory is an error. Validating up front matters because the
+    /// alternative, which this code used to do, was to send the prompt to the
+    /// model and only discover the bad directory when a tool call tried to use
+    /// it, surfacing as a tool error the model then reasoned about.
+    ///
+    /// Canonicalizing once establishes the precondition `resolve_tool_path`
+    /// relies on (a canonical root) in one place, so tools no longer repeat the
+    /// resolution on every call. It is done synchronously on purpose: this runs
+    /// once, before any model call, and is not on the tool execution path where
+    /// blocking I/O is forbidden.
     pub fn new(
         prompt: impl Into<String>,
-        working_directory: impl Into<String>,
+        working_directory: impl AsRef<Path>,
     ) -> Result<Self, HarnessError> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return Err(HarnessError::EmptyPrompt);
         }
 
+        let requested = working_directory.as_ref();
+        let invalid = |reason: String| HarnessError::InvalidWorkingDirectory {
+            path: requested.display().to_string(),
+            reason,
+        };
+        let working_directory =
+            std::fs::canonicalize(requested).map_err(|error| invalid(error.to_string()))?;
+        // `Path::is_dir` swallows metadata errors as `false`, which would report a
+        // permission problem as "not a directory"; ask for the metadata directly.
+        let metadata =
+            std::fs::metadata(&working_directory).map_err(|error| invalid(error.to_string()))?;
+        if !metadata.is_dir() {
+            return Err(invalid("not a directory".to_string()));
+        }
+
         Ok(Self {
             prompt,
-            working_directory: working_directory.into(),
+            working_directory,
         })
     }
 
@@ -51,8 +75,8 @@ impl HarnessRequest {
         &self.prompt
     }
 
-    /// Returns the working directory context the harness should treat as root.
-    pub fn working_directory(&self) -> &str {
+    /// Returns the canonical, existing directory the harness treats as root.
+    pub fn working_directory(&self) -> &Path {
         &self.working_directory
     }
 }
@@ -66,12 +90,18 @@ impl HarnessRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRequest {
     prompt: String,
-    working_directory: String,
+    working_directory: PathBuf,
 }
 
 impl ProviderRequest {
     /// Builds the narrow request a provider needs to produce assistant text.
-    pub fn new(prompt: impl Into<String>, working_directory: impl Into<String>) -> Self {
+    ///
+    /// This constructor does not validate the directory; the harness has
+    /// already done that when it built the `HarnessRequest`. Tests and other
+    /// direct callers may pass any path, but tools fail containment on any
+    /// root that is not the canonical absolute form (relative, symlinked, or
+    /// containing `..`), not only on one that does not exist.
+    pub fn new(prompt: impl Into<String>, working_directory: impl Into<PathBuf>) -> Self {
         Self {
             prompt: prompt.into(),
             working_directory: working_directory.into(),
@@ -83,8 +113,9 @@ impl ProviderRequest {
         &self.prompt
     }
 
-    /// Returns the working directory context selected by the harness.
-    pub fn working_directory(&self) -> &str {
+    /// Returns the working directory the harness resolved, which tools treat as
+    /// the containment root and providers may show to the model.
+    pub fn working_directory(&self) -> &Path {
         &self.working_directory
     }
 }
@@ -233,12 +264,19 @@ impl Harness {
 pub enum HarnessError {
     /// The harness cannot reason about a request without user intent.
     EmptyPrompt,
+    /// The working directory does not exist, cannot be resolved, or is not a
+    /// directory. `path` is what the caller passed, not a canonical form, so the
+    /// user recognizes it in the message.
+    InvalidWorkingDirectory { path: String, reason: String },
 }
 
 impl std::fmt::Display for HarnessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyPrompt => f.write_str("prompt must not be empty"),
+            Self::InvalidWorkingDirectory { path, reason } => {
+                write!(f, "working directory `{path}` is not usable: {reason}")
+            }
         }
     }
 }
@@ -268,7 +306,7 @@ mod tests {
             Ok(ProviderTurn::Final(format!(
                 "provider saw {} from {}",
                 request.prompt(),
-                request.working_directory()
+                request.working_directory().display()
             )))
         }
 
@@ -355,36 +393,100 @@ mod tests {
         );
     }
 
+    /// A bad `--cwd` must fail before any provider call, not surface later as
+    /// a tool error the model has to reason about. Both a missing path and a
+    /// path that exists but is a file are rejected, and the message names the
+    /// path as the caller typed it.
+    #[test]
+    fn rejects_missing_or_non_directory_working_directory() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let file = dir.path().join("file.txt");
+        fs::write(&file, "x").unwrap();
+
+        let missing_error = HarnessRequest::new("prompt", &missing).unwrap_err();
+        let file_error = HarnessRequest::new("prompt", &file).unwrap_err();
+
+        assert!(matches!(
+            &missing_error,
+            HarnessError::InvalidWorkingDirectory { path, .. } if path == &missing.display().to_string()
+        ));
+        assert!(missing_error.to_string().starts_with(&format!(
+            "working directory `{}` is not usable",
+            missing.display()
+        )));
+        assert!(matches!(
+            file_error,
+            HarnessError::InvalidWorkingDirectory { ref reason, .. } if reason == "not a directory"
+        ));
+    }
+
+    /// The working directory handed to providers and tools is the canonical
+    /// form: a `..` segment is resolved away and, on Unix, a symlinked `--cwd`
+    /// resolves to its target. The symlink case is the one containment depends
+    /// on, since `resolve_tool_path` compares canonical paths against this root.
+    #[test]
+    fn working_directory_is_canonicalized() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        let expected = nested.canonicalize().unwrap();
+        let dotted = dir.path().join("a").join("b").join("..").join("b");
+
+        let request = HarnessRequest::new("prompt", &dotted).unwrap();
+
+        assert_eq!(request.working_directory(), expected);
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&nested, &link).unwrap();
+
+            let request = HarnessRequest::new("prompt", &link).unwrap();
+
+            assert_eq!(request.working_directory(), expected);
+        }
+    }
+
     #[tokio::test]
     async fn handles_request_context_through_provider() {
+        let dir = tempdir().unwrap();
         let harness = Harness::new();
-        let request = HarnessRequest::new("inspect failures", "/work").unwrap();
+        let request = HarnessRequest::new("inspect failures", dir.path()).unwrap();
 
         let response = harness.handle(&request, &EchoProvider).await.unwrap();
 
         assert_eq!(
             response.summary(),
-            "provider saw inspect failures from /work"
+            format!(
+                "provider saw inspect failures from {}",
+                request.working_directory().display()
+            )
         );
     }
 
     #[tokio::test]
     async fn repository_prompts_are_not_special_cased() {
+        let dir = tempdir().unwrap();
         let harness = Harness::new();
-        let request = HarnessRequest::new("summarize this repository", "/work").unwrap();
+        let request = HarnessRequest::new("summarize this repository", dir.path()).unwrap();
 
         let response = harness.handle(&request, &EchoProvider).await.unwrap();
 
         assert_eq!(
             response.summary(),
-            "provider saw summarize this repository from /work"
+            format!(
+                "provider saw summarize this repository from {}",
+                request.working_directory().display()
+            )
         );
     }
 
     #[tokio::test]
     async fn provider_errors_cross_the_harness_boundary() {
+        let dir = tempdir().unwrap();
         let harness = Harness::new();
-        let request = HarnessRequest::new("inspect failures", "/work").unwrap();
+        let request = HarnessRequest::new("inspect failures", dir.path()).unwrap();
 
         let error = harness
             .handle(&request, &FailingProvider)
@@ -410,8 +512,7 @@ mod tests {
                 r#"{"path":"README.md"}"#,
             )],
         ]);
-        let request =
-            HarnessRequest::new("read project files", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read project files", dir.path()).unwrap();
 
         let response = Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -438,7 +539,7 @@ mod tests {
             )]
         });
         let provider = ScriptedProvider::new(calls);
-        let request = HarnessRequest::new("loop", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("loop", dir.path()).unwrap();
 
         let error = Harness::new()
             .handle(&request, &provider)
@@ -465,7 +566,7 @@ mod tests {
             "ferricode_list_directory",
             r#"{"path":"."}"#,
         )]]);
-        let request = HarnessRequest::new("list", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("list", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -493,7 +594,7 @@ mod tests {
             "ferricode_list_directory",
             r#"{"path":"."}"#,
         )]]);
-        let request = HarnessRequest::new("list", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("list", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -514,7 +615,7 @@ mod tests {
             "ferricode_read_file",
             r#"{"path":"large.txt"}"#,
         )]]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -537,7 +638,7 @@ mod tests {
             "ferricode_read_file",
             r#"{"path":"large.txt"}"#,
         )]]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -560,7 +661,7 @@ mod tests {
             "ferricode_read_file",
             r#"{"path":"data.bin"}"#,
         )]]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -581,7 +682,7 @@ mod tests {
             "ferricode_read_file",
             r#"{"path":"large.txt"}"#,
         )]]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -601,7 +702,7 @@ mod tests {
             "ferricode_read_file",
             r#"{"path":"invalid.txt"}"#,
         )]]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -635,7 +736,7 @@ mod tests {
             r#"{"path":"link"}"#,
         ));
         let provider = ScriptedProvider::new([calls]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -683,7 +784,7 @@ mod tests {
             r#"{"path":"link"}"#,
         ));
         let provider = ScriptedProvider::new([calls]);
-        let request = HarnessRequest::new("list", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("list", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -725,7 +826,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let provider = ScriptedProvider::new([calls]);
-        let request = HarnessRequest::new("list", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("list", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -749,7 +850,7 @@ mod tests {
             "ferricode_read_file",
             "x".repeat((16 * 1024) + 1),
         )]]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
@@ -773,7 +874,7 @@ mod tests {
             ToolCall::new("missing", "ferricode_read_file", r#"{}"#),
             ToolCall::new("empty", "ferricode_read_file", r#"{"path":""}"#),
         ]]);
-        let request = HarnessRequest::new("read", dir.path().to_string_lossy()).unwrap();
+        let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
