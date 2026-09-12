@@ -874,26 +874,45 @@ mod tests {
         }));
     }
 
+    /// Tool-size policy violations are recoverable model inputs, not harness failures.
+    /// Each oversized field must produce a structured error so the model can adjust
+    /// its next call while the provider interaction remains alive.
     #[tokio::test]
     async fn oversized_tool_arguments_return_structured_error() {
         let dir = tempdir().unwrap();
-        let provider = ScriptedProvider::new([vec![ToolCall::new(
-            "large",
-            "ferricode_read_file",
-            "x".repeat((16 * 1024) + 1),
-        )]]);
+        let provider = ScriptedProvider::new([vec![
+            ToolCall::new("large", "ferricode_read_file", "x".repeat((16 * 1024) + 1)),
+            ToolCall::new("x".repeat(257), "ferricode_read_file", r#"{"path":"."}"#),
+            ToolCall::new("name", "x".repeat(257), r#"{"path":"."}"#),
+        ]]);
         let request = HarnessRequest::new("read", dir.path()).unwrap();
 
         Harness::new().handle(&request, &provider).await.unwrap();
 
         let outputs = provider.outputs.lock().unwrap();
-        let output = parse_output(&outputs[0][0]);
-        assert_eq!(output["ok"], false);
+        assert_eq!(outputs[0].len(), 3);
+        for output in &outputs[0] {
+            let output = parse_output(output);
+            assert_eq!(output["ok"], false);
+            assert!(output["error"].as_str().is_some());
+        }
         assert!(
-            output["error"]
+            parse_output(&outputs[0][0])["error"]
                 .as_str()
                 .unwrap()
                 .contains("tool arguments exceeded")
+        );
+        assert!(
+            parse_output(&outputs[0][1])["error"]
+                .as_str()
+                .unwrap()
+                .contains("tool call id exceeded")
+        );
+        assert!(
+            parse_output(&outputs[0][2])["error"]
+                .as_str()
+                .unwrap()
+                .contains("tool name exceeded")
         );
     }
 

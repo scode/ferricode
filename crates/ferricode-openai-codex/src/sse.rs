@@ -1,10 +1,11 @@
 //! Parses Responses API JSON and SSE output into assistant turns.
 //!
 //! This module treats backend event data as untrusted protocol input. While
-//! reassembling function calls it caps the streamed output index and the
-//! function-call id, name, and argument sizes (see the `MAX_*` constants) so a
-//! hostile stream cannot allocate unboundedly. It parses transport output only:
-//! it never executes calls, selects tools, or decides provider policy.
+//! reassembling function calls it caps the streamed output index and bounds
+//! the size of each buffered function-call field so a single runaway field
+//! cannot exhaust memory; it does not bound the number of output items or the
+//! assistant text. It parses transport output only: it never executes calls,
+//! selects tools, or decides provider policy.
 
 use crate::{OpenAiCodexError, OpenAiCodexState};
 use ferricode_core::{ProviderTurn, ToolCall};
@@ -13,9 +14,14 @@ use std::collections::BTreeMap;
 use std::str;
 
 const MAX_STREAMING_OUTPUT_INDEX: usize = 1024;
-const MAX_FUNCTION_CALL_ID_BYTES: usize = 256;
-const MAX_FUNCTION_CALL_NAME_BYTES: usize = 256;
-const MAX_FUNCTION_CALL_ARGUMENT_BYTES: usize = 16 * 1024;
+
+/// Maximum bytes retained for one streamed function-call field while it is
+/// being reassembled. This is a transport guard, not tool policy: it must stay
+/// well above core's per-field tool-call limits (see `ferricode_core::tools`),
+/// so anything core would reject reaches core and becomes a recoverable tool
+/// error rather than a transport failure that aborts the run. Exceeding it is
+/// a `Protocol` error because a real backend never emits fields this large.
+const MAX_STREAMED_FUNCTION_CALL_BYTES: usize = 256 * 1024;
 
 /// Parses either JSON or minimal SSE `data:` events into assistant text.
 pub fn parse_assistant_text(text: &str) -> Result<String, OpenAiCodexError> {
@@ -140,17 +146,13 @@ impl SseAccumulator {
                 let index = required_event_output_index(&value)?;
                 let delta = required_event_string(&value, "delta")?;
                 let call = self.function_calls.entry(index).or_default();
-                if call.arguments.len() + delta.len() > MAX_FUNCTION_CALL_ARGUMENT_BYTES {
-                    return Err(OpenAiCodexError::Protocol(format!(
-                        "streamed function call arguments exceeded the limit of {MAX_FUNCTION_CALL_ARGUMENT_BYTES} bytes"
-                    )));
-                }
+                check_streamed_function_call_size("arguments", call.arguments.len() + delta.len())?;
                 call.arguments.push_str(delta);
             }
             Some("response.function_call_arguments.done") => {
                 let index = required_event_output_index(&value)?;
                 let arguments = required_event_string(&value, "arguments")?;
-                validate_function_call_field("arguments", arguments)?;
+                check_streamed_function_call_size("arguments", arguments.len())?;
                 self.function_calls.entry(index).or_default().arguments = arguments.to_string();
             }
             Some("response.output_item.done") => {
@@ -304,29 +306,16 @@ fn required_function_call_string<'a>(
             "function_call item did not include string `{field}`"
         ))
     })?;
-    validate_function_call_field(field, value)?;
     Ok(value)
 }
 
-fn validate_function_call_field(field: &str, value: &str) -> Result<(), OpenAiCodexError> {
-    let Some(limit) = function_call_field_limit(field) else {
-        return Ok(());
-    };
-    if value.len() > limit {
+fn check_streamed_function_call_size(field: &str, size: usize) -> Result<(), OpenAiCodexError> {
+    if size > MAX_STREAMED_FUNCTION_CALL_BYTES {
         return Err(OpenAiCodexError::Protocol(format!(
-            "function_call `{field}` exceeded the limit of {limit} bytes"
+            "streamed function call `{field}` exceeded the buffer limit of {MAX_STREAMED_FUNCTION_CALL_BYTES} bytes"
         )));
     }
     Ok(())
-}
-
-fn function_call_field_limit(field: &str) -> Option<usize> {
-    match field {
-        "call_id" => Some(MAX_FUNCTION_CALL_ID_BYTES),
-        "name" => Some(MAX_FUNCTION_CALL_NAME_BYTES),
-        "arguments" => Some(MAX_FUNCTION_CALL_ARGUMENT_BYTES),
-        _ => None,
-    }
 }
 
 fn is_function_call_item(item: &Value) -> bool {
@@ -377,17 +366,17 @@ struct StreamingFunctionCall {
 impl StreamingFunctionCall {
     fn merge_item(&mut self, item: &Value) -> Result<(), OpenAiCodexError> {
         if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
-            validate_function_call_field("call_id", call_id)?;
+            check_streamed_function_call_size("call_id", call_id.len())?;
             self.call_id = Some(call_id.to_string());
         }
         if let Some(name) = item.get("name").and_then(Value::as_str) {
-            validate_function_call_field("name", name)?;
+            check_streamed_function_call_size("name", name.len())?;
             self.name = Some(name.to_string());
         }
         if let Some(arguments) = item.get("arguments").and_then(Value::as_str)
             && !arguments.is_empty()
         {
-            validate_function_call_field("arguments", arguments)?;
+            check_streamed_function_call_size("arguments", arguments.len())?;
             self.arguments = arguments.to_string();
         }
         Ok(())
@@ -483,8 +472,10 @@ data: [DONE]"#;
         assert!(error.to_string().contains("arguments"));
     }
 
+    /// A JSON response just over core's argument limit must reach core intact,
+    /// where the harness can turn the policy violation into a tool error.
     #[test]
-    fn json_function_call_rejects_oversized_arguments() {
+    fn json_function_call_passes_through_arguments_over_core_limit() {
         let body = json!({
             "output": [{
                 "type": "function_call",
@@ -495,10 +486,13 @@ data: [DONE]"#;
         })
         .to_string();
 
-        let error = parse_assistant_turn(&body).unwrap_err();
+        let turn = parse_assistant_turn(&body).unwrap();
 
-        assert!(error.to_string().contains("arguments"));
-        assert!(error.to_string().contains("limit"));
+        let ProviderTurn::ToolCalls { calls, .. } = turn else {
+            panic!("expected function call turn");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments(), "x".repeat((16 * 1024) + 1));
     }
 
     #[test]
@@ -573,8 +567,10 @@ data: {"type":"response.completed"}"#;
         assert!(error.to_string().contains("output_index"));
     }
 
+    /// A streamed argument just over core's limit is still below the transport
+    /// buffer guard and must be passed through without truncation.
     #[test]
-    fn streamed_function_call_rejects_oversized_argument_delta() {
+    fn streamed_function_call_passes_through_delta_over_core_limit() {
         let body = format!(
             "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"ferricode_read_file\",\"arguments\":\"\"}}}}\n\
 data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}}\n\
@@ -582,10 +578,53 @@ data: {{\"type\":\"response.completed\"}}",
             "x".repeat((16 * 1024) + 1)
         );
 
+        let turn = parse_assistant_turn(&body).unwrap();
+
+        let ProviderTurn::ToolCalls { calls, .. } = turn else {
+            panic!("expected function call turn");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments(), "x".repeat((16 * 1024) + 1));
+    }
+
+    /// The buffer guard is cumulative across deltas: two deltas that are each
+    /// under the ceiling but together exceed it are a broken transport input,
+    /// so parsing must fail before producing a tool call. A guard that only
+    /// looked at each delta on its own would pass this stream.
+    #[test]
+    fn streamed_function_call_rejects_transport_buffer_overflow() {
+        let body = format!(
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"ferricode_read_file\",\"arguments\":\"\"}}}}\n\
+data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}}\n\
+data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}}\n\
+data: {{\"type\":\"response.completed\"}}",
+            "x".repeat(128 * 1024),
+            "x".repeat((128 * 1024) + 1)
+        );
+
         let error = parse_assistant_turn(&body).unwrap_err();
 
-        assert!(error.to_string().contains("arguments"));
-        assert!(error.to_string().contains("limit"));
+        assert!(
+            matches!(error, OpenAiCodexError::Protocol(message) if message.contains("buffer limit"))
+        );
+    }
+
+    /// The same ceiling applies to the identifier fields carried on an item
+    /// event, not only to streamed argument text, so an absurd `call_id` fails
+    /// the same way.
+    #[test]
+    fn streamed_function_call_rejects_oversized_call_id() {
+        let body = format!(
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"call_id\":\"{}\",\"name\":\"ferricode_read_file\",\"arguments\":\"\"}}}}\n\
+data: {{\"type\":\"response.completed\"}}",
+            "c".repeat((256 * 1024) + 1)
+        );
+
+        let error = parse_assistant_turn(&body).unwrap_err();
+
+        assert!(
+            matches!(error, OpenAiCodexError::Protocol(message) if message.contains("`call_id`"))
+        );
     }
 
     #[test]
