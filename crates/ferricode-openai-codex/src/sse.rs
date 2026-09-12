@@ -88,8 +88,11 @@ fn parse_response_turn(value: &Value) -> Result<ProviderTurn<OpenAiCodexState>, 
     if !calls.is_empty() {
         return Ok(ProviderTurn::ToolCalls {
             state: OpenAiCodexState {
+                // Placeholders: the parser only sees the response. `responses.rs`
+                // overwrites both from the request body before the state is returned.
                 input_items: Vec::new(),
                 output_items,
+                instructions: String::new(),
             },
             calls,
         });
@@ -184,8 +187,11 @@ impl SseAccumulator {
             let calls = collect_streaming_function_calls(&self.function_calls);
             return Ok(ProviderTurn::ToolCalls {
                 state: OpenAiCodexState {
+                    // Placeholders, as in `parse_response_turn`: overwritten by
+                    // `responses.rs` from the request body.
                     input_items: Vec::new(),
                     output_items: self.output_items,
+                    instructions: String::new(),
                 },
                 calls,
             });
