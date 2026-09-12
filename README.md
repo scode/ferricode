@@ -41,8 +41,8 @@ cargo run -p ferric -- run "summarize this repository" --cwd /path/to/repo
 
 See `docs/tools.md` for the current built-in tool behavior and filesystem limits.
 
-The `tui` subcommand currently uses the TUI crate boundary and prints the same harness response instead of drawing a
-full terminal interface:
+The `tui` subcommand currently uses the TUI crate boundary and streams the assistant text to stdout as it arrives
+instead of drawing a full terminal interface:
 
 ```sh
 cargo run -p ferric -- tui "summarize this repository" --cwd /path/to/repo

@@ -5,7 +5,9 @@
 //! the harness can remain usable from the CLI, tests, and future non-terminal
 //! front ends.
 
-use ferricode_core::{Harness, HarnessRequest, HarnessResponse, ModelProvider, ProviderError};
+use ferricode_core::{
+    Harness, HarnessEventSink, HarnessRequest, HarnessResponse, ModelProvider, ProviderError,
+};
 
 /// Builds the first TUI-facing response through the core harness.
 ///
@@ -15,15 +17,16 @@ use ferricode_core::{Harness, HarnessRequest, HarnessResponse, ModelProvider, Pr
 pub async fn launch(
     request: HarnessRequest,
     provider: &dyn ModelProvider,
+    sink: &dyn HarnessEventSink,
 ) -> Result<HarnessResponse, ProviderError> {
-    Harness::new().handle(&request, provider).await
+    Harness::new().handle(&request, provider, sink).await
 }
 
 #[cfg(test)]
 mod tests {
     use ferricode_core::{
-        HarnessRequest, ModelProvider, ProviderFuture, ProviderRequest, ProviderTurn, Transcript,
-        TranscriptItem,
+        HarnessEventSink, HarnessRequest, ModelProvider, NoopEventSink, ProviderFuture,
+        ProviderRequest, ProviderTurn, Transcript, TranscriptItem,
     };
 
     struct StaticProvider;
@@ -33,6 +36,7 @@ mod tests {
             &'a self,
             request: &'a ProviderRequest,
             _: &'a Transcript,
+            _: &'a dyn HarnessEventSink,
         ) -> ProviderFuture<'a> {
             Box::pin(async move {
                 let text = format!("tui saw {}", request.prompt());
@@ -48,7 +52,9 @@ mod tests {
     async fn launch_uses_core_harness() {
         let request = HarnessRequest::new("open tui", ".").unwrap();
 
-        let response = super::launch(request, &StaticProvider).await.unwrap();
+        let response = super::launch(request, &StaticProvider, &NoopEventSink)
+            .await
+            .unwrap();
 
         assert_eq!(response.summary(), "tui saw open tui");
     }

@@ -8,7 +8,9 @@
 //! selects tools, or decides provider policy.
 
 use crate::{OpenAiCodexError, PROVIDER_NAME};
-use ferricode_core::{ProviderTurn, ToolCall, TranscriptItem};
+use ferricode_core::{
+    HarnessEvent, HarnessEventSink, NoopEventSink, ProviderTurn, ToolCall, TranscriptItem,
+};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str;
@@ -32,17 +34,33 @@ pub fn parse_assistant_text(text: &str) -> Result<String, OpenAiCodexError> {
 }
 
 pub(crate) fn parse_assistant_turn(text: &str) -> Result<ProviderTurn, OpenAiCodexError> {
+    parse_assistant_turn_with_sink(text, &NoopEventSink)
+}
+
+/// Parses one buffered backend response while forwarding its visible text.
+///
+/// This keeps the sink-less parser free of event-observation requirements,
+/// while the provider uses the same parser with its caller's sink.
+pub(crate) fn parse_assistant_turn_with_sink(
+    text: &str,
+    sink: &dyn HarnessEventSink,
+) -> Result<ProviderTurn, OpenAiCodexError> {
     let trimmed = text.trim();
     if trimmed.lines().any(|line| line.starts_with("data:")) {
-        return parse_sse_assistant_text(trimmed);
+        return parse_sse_assistant_text(trimmed, sink);
     }
 
     let value: Value = serde_json::from_str(trimmed)?;
-    parse_response_turn(&value)
+    let turn = parse_response_turn(&value)?;
+    forward_buffered_text(sink, &turn);
+    Ok(turn)
 }
 
-fn parse_sse_assistant_text(text: &str) -> Result<ProviderTurn, OpenAiCodexError> {
-    let mut accumulator = SseAccumulator::default();
+fn parse_sse_assistant_text(
+    text: &str,
+    sink: &dyn HarnessEventSink,
+) -> Result<ProviderTurn, OpenAiCodexError> {
+    let mut accumulator = SseAccumulator::new(sink);
     for line in text.lines() {
         if accumulator.process_line(line.as_bytes())? == SseDataAction::Complete {
             break;
@@ -54,9 +72,10 @@ fn parse_sse_assistant_text(text: &str) -> Result<ProviderTurn, OpenAiCodexError
 
 pub(crate) async fn parse_sse_assistant_stream(
     response: &mut reqwest::Response,
+    sink: &dyn HarnessEventSink,
 ) -> Result<ProviderTurn, OpenAiCodexError> {
     let mut pending = Vec::new();
-    let mut accumulator = SseAccumulator::default();
+    let mut accumulator = SseAccumulator::new(sink);
 
     while let Some(chunk) = response.chunk().await? {
         pending.extend_from_slice(&chunk);
@@ -94,14 +113,25 @@ fn parse_response_turn(value: &Value) -> Result<ProviderTurn, OpenAiCodexError> 
     Ok(final_turn(text, items))
 }
 
-#[derive(Default)]
-struct SseAccumulator {
+/// Retains complete streamed text for the returned turn while forwarding each
+/// delta immediately to the caller's sink.
+struct SseAccumulator<'a> {
     text: String,
     output_items: BTreeMap<usize, Value>,
     function_calls: BTreeMap<usize, StreamingFunctionCall>,
+    sink: &'a dyn HarnessEventSink,
 }
 
-impl SseAccumulator {
+impl<'a> SseAccumulator<'a> {
+    fn new(sink: &'a dyn HarnessEventSink) -> Self {
+        Self {
+            text: String::new(),
+            output_items: BTreeMap::new(),
+            function_calls: BTreeMap::new(),
+            sink,
+        }
+    }
+
     fn process_line(&mut self, line: &[u8]) -> Result<SseDataAction, OpenAiCodexError> {
         let line = parse_sse_line(line)?;
         let Some(data) = line.strip_prefix("data:") else {
@@ -122,6 +152,8 @@ impl SseAccumulator {
         let value = serde_json::from_str::<Value>(data)?;
         if let Some(text) = extract_text_from_event(&value) {
             self.text.push_str(&text);
+            self.sink
+                .on_event(HarnessEvent::AssistantTextDelta { text });
         }
 
         match value.get("type").and_then(Value::as_str) {
@@ -194,6 +226,15 @@ impl SseAccumulator {
             self.output_items.insert(*index, item);
         }
         Ok(())
+    }
+}
+
+/// Forwards buffered response text as one delta so JSON and SSE expose the
+/// same visible assistant text; core emits the turn completion after parsing.
+fn forward_buffered_text(sink: &dyn HarnessEventSink, turn: &ProviderTurn) {
+    let text = turn.assistant_text();
+    if !text.is_empty() {
+        sink.on_event(HarnessEvent::AssistantTextDelta { text });
     }
 }
 
@@ -456,6 +497,18 @@ fn collect_text(pieces: impl Iterator<Item = String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferricode_core::{HarnessEvent, HarnessEventSink};
+    use std::sync::Mutex;
+
+    /// Captures parser events without involving a network response or UI.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<HarnessEvent>>);
+
+    impl HarnessEventSink for RecordingSink {
+        fn on_event(&self, event: HarnessEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
 
     #[test]
     fn parses_json_response_text() {
@@ -471,6 +524,113 @@ data: {"type":"response.output_text.delta","delta":"lo"}
 data: [DONE]"#;
 
         assert_eq!(parse_assistant_text(text).unwrap(), "hello");
+    }
+
+    /// Streaming text must be forwarded in data-line order; core, rather than
+    /// this provider parser, announces that the final turn completed.
+    #[test]
+    fn forwards_sse_text_deltas_in_order() {
+        let text = r#"data: {"type":"response.output_text.delta","delta":"hel"}
+data: {"type":"response.output_text.delta","delta":"lo"}
+data: [DONE]"#;
+        let sink = RecordingSink::default();
+
+        let turn = parse_assistant_turn_with_sink(text, &sink).unwrap();
+
+        assert!(matches!(turn, ProviderTurn::Final { ref text, .. } if text == "hello"));
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![
+                HarnessEvent::AssistantTextDelta {
+                    text: "hel".to_string(),
+                },
+                HarnessEvent::AssistantTextDelta {
+                    text: "lo".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// Buffered JSON exposes one complete-text delta; core adds the matching
+    /// turn completion after the provider returns the parsed turn.
+    #[test]
+    fn forwards_buffered_json_as_one_delta() {
+        let sink = RecordingSink::default();
+
+        parse_assistant_turn_with_sink(r#"{"output_text":"hello"}"#, &sink).unwrap();
+
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![HarnessEvent::AssistantTextDelta {
+                text: "hello".to_string(),
+            }]
+        );
+    }
+
+    /// Buffered tool-call responses can include a visible assistant message,
+    /// which must be forwarded before core executes the returned call.
+    #[test]
+    fn forwards_text_from_a_buffered_json_tool_call_turn() {
+        let sink = RecordingSink::default();
+        let text = r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect it."}]},{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}]}"#;
+
+        parse_assistant_turn_with_sink(text, &sink).unwrap();
+
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![HarnessEvent::AssistantTextDelta {
+                text: "I will inspect it.".to_string(),
+            }]
+        );
+    }
+
+    /// A streamed message can accompany function calls, so it must survive in
+    /// transcript order and reach the sink even though core owns completion.
+    #[test]
+    fn forwards_text_from_an_sse_tool_call_turn_without_completing_it() {
+        let text = r#"data: {"type":"response.output_text.delta","delta":"I will inspect it."}
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect it."}]}}
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}}
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}}
+data: {"type":"response.completed"}"#;
+        let sink = RecordingSink::default();
+
+        let turn = parse_assistant_turn_with_sink(text, &sink).unwrap();
+
+        assert!(matches!(
+            turn,
+            ProviderTurn::ToolCalls { items }
+                if matches!(
+                    items.as_slice(),
+                    [
+                        TranscriptItem::AssistantMessage { text },
+                        TranscriptItem::ToolCall(call),
+                    ] if text == "I will inspect it." && call.id() == "call_1"
+                )
+        ));
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![HarnessEvent::AssistantTextDelta {
+                text: "I will inspect it.".to_string(),
+            }]
+        );
+    }
+
+    /// A failed stream may already have shown text, but it must not fabricate
+    /// another event or a completed turn after the backend reports failure.
+    #[test]
+    fn preserves_prior_delta_when_an_sse_response_fails() {
+        let text = r#"data: {"type":"response.output_text.delta","delta":"partial"}
+data: {"type":"response.failed"}"#;
+        let sink = RecordingSink::default();
+
+        assert!(parse_assistant_turn_with_sink(text, &sink).is_err());
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![HarnessEvent::AssistantTextDelta {
+                text: "partial".to_string(),
+            }]
+        );
     }
 
     #[test]

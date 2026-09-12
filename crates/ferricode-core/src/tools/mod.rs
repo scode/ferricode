@@ -19,7 +19,7 @@
 mod list_directory;
 mod read_file;
 
-use crate::ProviderRequest;
+use crate::{HarnessEvent, HarnessEventSink, ProviderRequest};
 use serde_json::{Value, json};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -191,7 +191,12 @@ impl ToolOutput {
 pub(crate) async fn execute_tool_calls(
     request: &ProviderRequest,
     calls: Vec<ToolCall>,
+    sink: &dyn HarnessEventSink,
 ) -> Vec<ToolOutput> {
+    // An over-limit turn is rejected as a batch: no call runs, so no
+    // `ToolCallStarted`/`ToolCallFinished` events fire for it either. Events
+    // describe work the harness actually did, and the structured errors below
+    // already tell the model what happened.
     if calls.len() > MAX_TOOL_CALLS_PER_TURN {
         return calls
             .into_iter()
@@ -208,8 +213,13 @@ pub(crate) async fn execute_tool_calls(
 
     let mut outputs = Vec::with_capacity(calls.len());
     for call in calls {
+        sink.on_event(HarnessEvent::ToolCallStarted { call: call.clone() });
         let output = execute_tool_call(request, &call).await;
-        outputs.push(ToolOutput::new(call.id, output));
+        let output = ToolOutput::new(call.id, output);
+        sink.on_event(HarnessEvent::ToolCallFinished {
+            output: output.clone(),
+        });
+        outputs.push(output);
     }
     outputs
 }

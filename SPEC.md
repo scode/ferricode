@@ -36,8 +36,9 @@ same during bootstrap, but they must not be treated as interchangeable.
 Core owns a provider-neutral transcript. Providers render that complete transcript into their wire format on every
 request and may attach opaque, provider-tagged items that core replays in order without inspecting; providers skip
 opaque items tagged for other providers; the provider trait is object-safe so front ends can choose a provider
-dynamically. Do not add registries, model selection, public streaming APIs, MCP, mutation tools, or provider fallback
-until the harness actually needs them.
+dynamically. Providers forward assistant text deltas to the core-owned event sink as they arrive. Do not add registries,
+model selection, provider streaming APIs, MCP, mutation tools, or provider fallback until the harness actually needs
+them.
 
 Core owns built-in tool orchestration and local tool policy. The first supported tools are read-only filesystem tools:
 directory listing and UTF-8 file reading under the request working directory. Provider crates may expose those tools
@@ -99,6 +100,7 @@ dependency injection or explicit configuration instead.
 
 # Current Non-Goals
 
-Do not add OpenAI Platform API-key support, model flags, reasoning-effort flags, public streaming APIs, MCP, mutation
-tools, keyring storage, or real TUI rendering in the bootstrap provider change. Provider internals may parse buffered
-SSE when the upstream transport requires it, but that must not become a public streaming API yet.
+Do not add OpenAI Platform API-key support, model flags, reasoning-effort flags, provider streaming APIs, MCP, mutation
+tools, keyring storage, or real TUI rendering in the bootstrap provider change. Provider crates expose no streaming API
+of their own; streamed output reaches front ends only through the core-owned event sink. Provider internals may parse
+buffered SSE when the upstream transport requires it, but that must not become a provider streaming API yet.
