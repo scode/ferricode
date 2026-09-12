@@ -38,7 +38,11 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CODEX_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
-const MODEL: &str = "gpt-5.4";
+/// Model sent on every Codex responses request. `gpt-5.4` was rejected by the
+/// backend on 2026-09-12 with "not supported when using Codex with a ChatGPT
+/// account"; `gpt-6-astra` was verified live through a tool turn the same day.
+/// SPEC.md names this model too and must stay in sync.
+const MODEL: &str = "gpt-6-astra";
 const REASONING_EFFORT: &str = "medium";
 const INSTRUCTIONS: &str = "You are Ferricode, a coding harness. Use the built-in filesystem tools when the user's request requires repository context. Start with a directory listing when you need to understand the working directory, then read specific relevant text files. Do not ask for clarification when the request can be handled by inspecting files.";
 const REFRESH_SKEW: Duration = Duration::from_secs(60);
@@ -2710,7 +2714,7 @@ data: {"type":"response.completed"}"#;
                 .to_ascii_lowercase()
                 .contains("authorization: bearer access")
         );
-        assert!(requests[0].contains(r#""model":"gpt-5.4""#));
+        assert!(requests[0].contains(r#""model":"gpt-6-astra""#));
         assert!(requests[0].contains(r#""effort":"medium""#));
     }
 
