@@ -44,6 +44,10 @@ Ferricode also caps the size of one tool call before execution. The provider cal
 256 bytes, and the argument string must fit within 16 KiB. Calls outside those limits are returned to the model as tool
 errors instead of being executed.
 
+Providers may also bound how large any one streamed function-call field may grow while buffered (currently 256 KiB in
+the OpenAI Codex provider) as a transport safety limit; everything at or under that bound reaches core, which applies
+the limits above.
+
 ## Execution Loop
 
 One request can take multiple model turns. The provider starts the interaction and either returns final assistant text
