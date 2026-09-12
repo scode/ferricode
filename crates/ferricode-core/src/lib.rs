@@ -187,21 +187,47 @@ pub trait ModelProvider {
     ) -> impl std::future::Future<Output = Result<ProviderTurn<Self::State>, ProviderError>> + Send + 'a;
 }
 
+/// Coarse classification of a provider failure, so front ends can decide what to do
+/// without parsing message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    /// No usable credentials; the front end should prompt the user to re-authenticate.
+    AuthRequired,
+    /// The request never got a response; the front end can retry the request.
+    Network,
+    /// The backend answered with a non-success status; the front end should report it.
+    BackendStatus,
+    /// The provider could not make sense of what it was given: a backend
+    /// response in an unexpected shape, or a stored file it cannot interpret.
+    /// Not retryable as-is; the front end should report it.
+    Protocol,
+    /// Any other failure, including local I/O and configuration errors; the front end should report it.
+    Other,
+}
+
 /// Provider failures surfaced through the harness boundary.
 ///
-/// The core crate keeps provider errors as user-facing text for now because the
-/// bootstrap harness has no recovery policy beyond reporting the failure.
+/// The kind gives front ends recovery information without making them parse
+/// the user-facing message. `Display` intentionally remains message-only so
+/// errors are readable at the CLI boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderError {
+    kind: ProviderErrorKind,
     message: String,
 }
 
 impl ProviderError {
-    /// Creates a provider error with an actionable message for the caller.
-    pub fn new(message: impl Into<String>) -> Self {
+    /// Creates a classified provider error with a message suitable for display.
+    pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
         }
+    }
+
+    /// Returns the coarse failure class that front ends can use for recovery.
+    pub fn kind(&self) -> ProviderErrorKind {
+        self.kind
     }
 }
 
@@ -252,9 +278,12 @@ impl Harness {
 
         match turn {
             ProviderTurn::Final(summary) => Ok(HarnessResponse::new(summary)),
-            ProviderTurn::ToolCalls { .. } => Err(ProviderError::new(format!(
-                "model exceeded the built-in tool turn limit of {MAX_TOOL_TURNS}"
-            ))),
+            // A harness policy limit, not a wire-shape problem, so `Other`
+            // rather than `Protocol`; nothing about the transport is broken.
+            ProviderTurn::ToolCalls { .. } => Err(ProviderError::new(
+                ProviderErrorKind::Other,
+                format!("model exceeded the built-in tool turn limit of {MAX_TOOL_TURNS}"),
+            )),
         }
     }
 }
@@ -286,8 +315,8 @@ impl std::error::Error for HarnessError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Harness, HarnessError, HarnessRequest, ModelProvider, ProviderError, ProviderRequest,
-        ProviderTurn, ToolCall, ToolOutput,
+        Harness, HarnessError, HarnessRequest, ModelProvider, ProviderError, ProviderErrorKind,
+        ProviderRequest, ProviderTurn, ToolCall, ToolOutput,
     };
     use serde_json::Value;
     use std::fs;
@@ -328,7 +357,10 @@ mod tests {
             &'a self,
             _request: &'a ProviderRequest,
         ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            Err(ProviderError::new("provider failed"))
+            Err(ProviderError::new(
+                ProviderErrorKind::Other,
+                "provider failed",
+            ))
         }
 
         async fn resume<'a>(

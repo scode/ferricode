@@ -18,7 +18,8 @@ use crate::{
     store::{default_auth_path, read_auth_file, write_auth_file},
 };
 use ferricode_core::{
-    ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolOutput, built_in_tools,
+    ModelProvider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderTurn, ToolOutput,
+    built_in_tools,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
@@ -80,6 +81,7 @@ impl OpenAiCodexProvider {
         match self.start(request).await? {
             ProviderTurn::Final(text) => Ok(text),
             ProviderTurn::ToolCalls { .. } => Err(ProviderError::new(
+                ProviderErrorKind::Protocol,
                 "model requested built-in tools outside the core harness",
             )),
         }
