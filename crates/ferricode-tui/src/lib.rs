@@ -14,7 +14,7 @@ use ferricode_core::{Harness, HarnessRequest, HarnessResponse, ModelProvider, Pr
 /// preserving the architectural boundary before a real TUI framework is added.
 pub async fn launch(
     request: HarnessRequest,
-    provider: &impl ModelProvider,
+    provider: &dyn ModelProvider,
 ) -> Result<HarnessResponse, ProviderError> {
     Harness::new().handle(&request, provider).await
 }
@@ -22,27 +22,25 @@ pub async fn launch(
 #[cfg(test)]
 mod tests {
     use ferricode_core::{
-        HarnessRequest, ModelProvider, ProviderError, ProviderRequest, ProviderTurn, ToolOutput,
+        HarnessRequest, ModelProvider, ProviderFuture, ProviderRequest, ProviderTurn, Transcript,
+        TranscriptItem,
     };
 
     struct StaticProvider;
 
     impl ModelProvider for StaticProvider {
-        type State = ();
-
-        async fn start<'a>(
+        fn complete<'a>(
             &'a self,
             request: &'a ProviderRequest,
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            Ok(ProviderTurn::Final(format!("tui saw {}", request.prompt())))
-        }
-
-        async fn resume<'a>(
-            &'a self,
-            _state: Self::State,
-            _tool_outputs: &'a [ToolOutput],
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            unreachable!("static test provider never requests tools")
+            _: &'a Transcript,
+        ) -> ProviderFuture<'a> {
+            Box::pin(async move {
+                let text = format!("tui saw {}", request.prompt());
+                Ok(ProviderTurn::Final {
+                    items: vec![TranscriptItem::AssistantMessage { text: text.clone() }],
+                    text,
+                })
+            })
         }
     }
 

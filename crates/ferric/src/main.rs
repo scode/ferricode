@@ -88,10 +88,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Keeping this separate from `main` lets tests cover non-auth command behavior
 /// without spawning the binary or installing a tracing subscriber.
-async fn run(
-    cli: Cli,
-    provider: &impl ModelProvider,
-) -> Result<String, Box<dyn std::error::Error>> {
+async fn run(cli: Cli, provider: &dyn ModelProvider) -> Result<String, Box<dyn std::error::Error>> {
     match cli.command {
         Command::Auth { command } => run_auth(command).await,
         Command::Run { prompt, cwd } => {
@@ -152,31 +149,29 @@ fn init_tracing() {
 mod tests {
     use super::{Cli, Parser};
     use ferricode_core::{
-        ModelProvider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderTurn, ToolOutput,
+        ModelProvider, ProviderError, ProviderErrorKind, ProviderFuture, ProviderRequest,
+        ProviderTurn, Transcript, TranscriptItem,
     };
 
     struct StaticProvider;
 
     impl ModelProvider for StaticProvider {
-        type State = ();
-
-        async fn start<'a>(
+        fn complete<'a>(
             &'a self,
             request: &'a ProviderRequest,
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            Ok(ProviderTurn::Final(format!(
-                "provider response from {}: {}",
-                request.working_directory().display(),
-                request.prompt()
-            )))
-        }
-
-        async fn resume<'a>(
-            &'a self,
-            _state: Self::State,
-            _tool_outputs: &'a [ToolOutput],
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            unreachable!("static test provider never requests tools")
+            _: &'a Transcript,
+        ) -> ProviderFuture<'a> {
+            Box::pin(async move {
+                let text = format!(
+                    "provider response from {}: {}",
+                    request.working_directory().display(),
+                    request.prompt()
+                );
+                Ok(ProviderTurn::Final {
+                    items: vec![TranscriptItem::AssistantMessage { text: text.clone() }],
+                    text,
+                })
+            })
         }
     }
 
@@ -185,21 +180,8 @@ mod tests {
     struct UnreachableProvider;
 
     impl ModelProvider for UnreachableProvider {
-        type State = ();
-
-        async fn start<'a>(
-            &'a self,
-            _request: &'a ProviderRequest,
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            panic!("provider must not be called for an invalid request")
-        }
-
-        async fn resume<'a>(
-            &'a self,
-            _state: Self::State,
-            _tool_outputs: &'a [ToolOutput],
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            unreachable!("unreachable test provider never requests tools")
+        fn complete<'a>(&'a self, _: &'a ProviderRequest, _: &'a Transcript) -> ProviderFuture<'a> {
+            Box::pin(async { panic!("provider must not be called for an invalid request") })
         }
     }
 
@@ -208,24 +190,13 @@ mod tests {
     struct AuthRequiredProvider;
 
     impl ModelProvider for AuthRequiredProvider {
-        type State = ();
-
-        async fn start<'a>(
-            &'a self,
-            _request: &'a ProviderRequest,
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            Err(ProviderError::new(
-                ProviderErrorKind::AuthRequired,
-                "authentication required",
-            ))
-        }
-
-        async fn resume<'a>(
-            &'a self,
-            _state: Self::State,
-            _tool_outputs: &'a [ToolOutput],
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            unreachable!("auth-required provider never requests tools")
+        fn complete<'a>(&'a self, _: &'a ProviderRequest, _: &'a Transcript) -> ProviderFuture<'a> {
+            Box::pin(async {
+                Err(ProviderError::new(
+                    ProviderErrorKind::AuthRequired,
+                    "authentication required",
+                ))
+            })
         }
     }
 

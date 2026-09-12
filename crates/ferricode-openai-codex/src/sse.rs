@@ -7,10 +7,10 @@
 //! assistant text. It parses transport output only: it never executes calls,
 //! selects tools, or decides provider policy.
 
-use crate::{OpenAiCodexError, OpenAiCodexState};
-use ferricode_core::{ProviderTurn, ToolCall};
+use crate::{OpenAiCodexError, PROVIDER_NAME};
+use ferricode_core::{ProviderTurn, ToolCall, TranscriptItem};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str;
 
 const MAX_STREAMING_OUTPUT_INDEX: usize = 1024;
@@ -26,14 +26,12 @@ const MAX_STREAMED_FUNCTION_CALL_BYTES: usize = 256 * 1024;
 /// Parses either JSON or minimal SSE `data:` events into assistant text.
 pub fn parse_assistant_text(text: &str) -> Result<String, OpenAiCodexError> {
     match parse_assistant_turn(text)? {
-        ProviderTurn::Final(text) => Ok(text),
+        ProviderTurn::Final { text, .. } => Ok(text),
         ProviderTurn::ToolCalls { .. } => Err(OpenAiCodexError::MissingAssistantText),
     }
 }
 
-pub(crate) fn parse_assistant_turn(
-    text: &str,
-) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+pub(crate) fn parse_assistant_turn(text: &str) -> Result<ProviderTurn, OpenAiCodexError> {
     let trimmed = text.trim();
     if trimmed.lines().any(|line| line.starts_with("data:")) {
         return parse_sse_assistant_text(trimmed);
@@ -43,9 +41,7 @@ pub(crate) fn parse_assistant_turn(
     parse_response_turn(&value)
 }
 
-fn parse_sse_assistant_text(
-    text: &str,
-) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+fn parse_sse_assistant_text(text: &str) -> Result<ProviderTurn, OpenAiCodexError> {
     let mut accumulator = SseAccumulator::default();
     for line in text.lines() {
         if accumulator.process_line(line.as_bytes())? == SseDataAction::Complete {
@@ -58,7 +54,7 @@ fn parse_sse_assistant_text(
 
 pub(crate) async fn parse_sse_assistant_stream(
     response: &mut reqwest::Response,
-) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+) -> Result<ProviderTurn, OpenAiCodexError> {
     let mut pending = Vec::new();
     let mut accumulator = SseAccumulator::default();
 
@@ -78,36 +74,30 @@ pub(crate) async fn parse_sse_assistant_stream(
     accumulator.into_provider_turn()
 }
 
-fn parse_response_turn(value: &Value) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+fn parse_response_turn(value: &Value) -> Result<ProviderTurn, OpenAiCodexError> {
     let output_items = value
         .get("output")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let calls = collect_function_calls(output_items.iter())?;
-    if !calls.is_empty() {
-        return Ok(ProviderTurn::ToolCalls {
-            state: OpenAiCodexState {
-                // Placeholders: the parser only sees the response. `responses.rs`
-                // overwrites both from the request body before the state is returned.
-                input_items: Vec::new(),
-                output_items,
-                instructions: String::new(),
-            },
-            calls,
-        });
+    let items = transcript_items_from_output(output_items)?;
+    if items
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::ToolCall(_)))
+    {
+        return Ok(ProviderTurn::ToolCalls { items });
     }
 
     let text = extract_text_from_response(value)
         .filter(|value| !value.trim().is_empty())
         .ok_or(OpenAiCodexError::MissingAssistantText)?;
-    Ok(ProviderTurn::Final(text))
+    Ok(final_turn(text, items))
 }
 
 #[derive(Default)]
 struct SseAccumulator {
     text: String,
-    output_items: Vec<Value>,
+    output_items: BTreeMap<usize, Value>,
     function_calls: BTreeMap<usize, StreamingFunctionCall>,
 }
 
@@ -159,15 +149,15 @@ impl SseAccumulator {
                 self.function_calls.entry(index).or_default().arguments = arguments.to_string();
             }
             Some("response.output_item.done") => {
+                let index = required_event_output_index(&value)?;
                 let item = required_event_value(&value, "item")?;
                 if is_function_call_item(item) {
-                    let index = required_event_output_index(&value)?;
                     self.function_calls
                         .entry(index)
                         .or_default()
                         .merge_item(item)?;
                 }
-                self.output_items.push(item.clone());
+                self.output_items.insert(index, item.clone());
             }
             Some("response.completed") => return Ok(SseDataAction::Complete),
             Some("response.failed" | "response.incomplete") => {
@@ -181,23 +171,16 @@ impl SseAccumulator {
         Ok(SseDataAction::Continue)
     }
 
-    fn into_provider_turn(mut self) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+    fn into_provider_turn(mut self) -> Result<ProviderTurn, OpenAiCodexError> {
         if !self.function_calls.is_empty() {
             self.merge_streaming_function_items()?;
-            let calls = collect_streaming_function_calls(&self.function_calls);
-            return Ok(ProviderTurn::ToolCalls {
-                state: OpenAiCodexState {
-                    // Placeholders, as in `parse_response_turn`: overwritten by
-                    // `responses.rs` from the request body.
-                    input_items: Vec::new(),
-                    output_items: self.output_items,
-                    instructions: String::new(),
-                },
-                calls,
-            });
+            let items = transcript_items_from_output(self.output_items.into_values().collect())?;
+            return Ok(ProviderTurn::ToolCalls { items });
         }
 
-        completed_sse_text(self.text).map(ProviderTurn::Final)
+        let text = completed_sse_text(self.text)?;
+        let items = transcript_items_from_output(self.output_items.into_values().collect())?;
+        Ok(final_turn(text, items))
     }
 
     fn merge_streaming_function_items(&mut self) -> Result<(), OpenAiCodexError> {
@@ -208,12 +191,8 @@ impl SseAccumulator {
                 )));
             }
             let item = call.to_item()?;
-            if self.output_items.len() <= *index {
-                self.output_items.resize(*index + 1, Value::Null);
-            }
-            self.output_items[*index] = item;
+            self.output_items.insert(*index, item);
         }
-        self.output_items.retain(|item| !item.is_null());
         Ok(())
     }
 }
@@ -282,12 +261,77 @@ fn extract_text_from_event(value: &Value) -> Option<String> {
     None
 }
 
-fn collect_function_calls<'a>(
-    items: impl Iterator<Item = &'a Value>,
-) -> Result<Vec<ToolCall>, OpenAiCodexError> {
-    items
-        .filter_map(function_call_from_item)
-        .collect::<Result<Vec<_>, _>>()
+/// Converts raw Responses output into core's ordered transcript vocabulary.
+///
+/// The provider keeps every item the backend produced. Known calls and
+/// assistant messages become entries core can render and execute; reasoning
+/// and future backend-specific item types stay opaque so the next request can
+/// echo them without teaching core this wire format.
+fn transcript_items_from_output(
+    output_items: Vec<Value>,
+) -> Result<Vec<TranscriptItem>, OpenAiCodexError> {
+    let mut call_ids = BTreeSet::new();
+    let mut items = Vec::with_capacity(output_items.len());
+    for item in output_items {
+        if let Some(call) = function_call_from_item(&item) {
+            let call = call?;
+            if !call_ids.insert(call.id().to_string()) {
+                return Err(OpenAiCodexError::Protocol(format!(
+                    "duplicate function call id `{}` in one response",
+                    call.id()
+                )));
+            }
+            items.push(TranscriptItem::ToolCall(call));
+        } else if is_assistant_message_item(&item) {
+            if let Some(text) = assistant_message_text(&item) {
+                items.push(TranscriptItem::AssistantMessage { text });
+            } else {
+                items.push(TranscriptItem::ProviderOpaque {
+                    provider: PROVIDER_NAME,
+                    payload: item,
+                });
+            }
+        } else {
+            items.push(TranscriptItem::ProviderOpaque {
+                provider: PROVIDER_NAME,
+                payload: item,
+            });
+        }
+    }
+    Ok(items)
+}
+
+/// Requires both `type: message` and `role: assistant`.
+///
+/// A bare `content` array is not accepted because the role is what makes it
+/// replayable as an assistant message; test fixtures must carry the full wire
+/// shape rather than relying on a lenient parser.
+fn is_assistant_message_item(item: &Value) -> bool {
+    matches!(item.get("type").and_then(Value::as_str), Some("message"))
+        && matches!(item.get("role").and_then(Value::as_str), Some("assistant"))
+}
+
+/// Returns renderable assistant text and leaves non-text messages opaque.
+///
+/// Refusals and empty content are meaningful provider state but have no core
+/// assistant-text representation, so callers preserve their original item.
+fn assistant_message_text(item: &Value) -> Option<String> {
+    extract_text_from_output_item(item).filter(|text| !text.trim().is_empty())
+}
+
+/// Builds a final turn, supplying a message when items lack one.
+///
+/// Top-level `output_text` shorthand and SSE deltas without a `done` item can
+/// provide final text without a completed message, so this preserves the
+/// transcript invariant that final text is replayable.
+fn final_turn(text: String, mut items: Vec<TranscriptItem>) -> ProviderTurn {
+    if !items
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::AssistantMessage { .. }))
+    {
+        items.push(TranscriptItem::AssistantMessage { text: text.clone() });
+    }
+    ProviderTurn::Final { text, items }
 }
 
 fn function_call_from_item(item: &Value) -> Option<Result<ToolCall, OpenAiCodexError>> {
@@ -404,21 +448,6 @@ impl StreamingFunctionCall {
     }
 }
 
-fn collect_streaming_function_calls(
-    calls: &BTreeMap<usize, StreamingFunctionCall>,
-) -> Vec<ToolCall> {
-    calls
-        .values()
-        .filter_map(|call| {
-            Some(ToolCall::new(
-                call.call_id.as_deref()?,
-                call.name.as_deref()?,
-                call.arguments.as_str(),
-            ))
-        })
-        .collect()
-}
-
 fn collect_text(pieces: impl Iterator<Item = String>) -> Option<String> {
     let joined = pieces.collect::<String>();
     (!joined.is_empty()).then_some(joined)
@@ -430,7 +459,7 @@ mod tests {
 
     #[test]
     fn parses_json_response_text() {
-        let text = r#"{"output":[{"content":[{"type":"output_text","text":"hello"}]}]}"#;
+        let text = r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}"#;
 
         assert_eq!(parse_assistant_text(text).unwrap(), "hello");
     }
@@ -459,14 +488,45 @@ data: [DONE]"#;
 
         let turn = parse_assistant_turn(text).unwrap();
 
-        let ProviderTurn::ToolCalls { state, calls } = turn else {
+        let ProviderTurn::ToolCalls { items } = turn else {
             panic!("expected function call turn");
         };
-        assert_eq!(state.output_items.len(), 1);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id(), "call_1");
-        assert_eq!(calls[0].name(), "ferricode_list_directory");
-        assert_eq!(calls[0].arguments(), r#"{"path":"."}"#);
+        assert!(
+            matches!(items.as_slice(), [TranscriptItem::ToolCall(call)] if call.id() == "call_1")
+        );
+    }
+
+    /// Reasoning is not a core concept, but it must stay immediately before
+    /// the call it informed so the next OpenAI request can retain that state.
+    #[test]
+    fn preserves_reasoning_before_a_function_call() {
+        let text = r#"{"output":[{"type":"reasoning","id":"rs_1","summary":[]},{"type":"function_call","call_id":"call_1","name":"ferricode_list_directory","arguments":"{\"path\":\".\"}"}]}"#;
+
+        let ProviderTurn::ToolCalls { items } = parse_assistant_turn(text).unwrap() else {
+            panic!("expected function call turn");
+        };
+
+        assert!(matches!(
+            items.as_slice(),
+            [TranscriptItem::ProviderOpaque { provider: PROVIDER_NAME, payload }, TranscriptItem::ToolCall(call)]
+                if payload["type"] == "reasoning" && call.id() == "call_1"
+        ));
+    }
+
+    /// Final assistant text has to become a transcript message, not merely the
+    /// response summary, or a later provider cannot render the conversation.
+    #[test]
+    fn converts_output_message_to_assistant_transcript_item() {
+        let text = r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}"#;
+
+        let ProviderTurn::Final { text, items } = parse_assistant_turn(text).unwrap() else {
+            panic!("expected final turn");
+        };
+
+        assert_eq!(text, "hello");
+        assert!(
+            matches!(items.as_slice(), [TranscriptItem::AssistantMessage { text }] if text == "hello")
+        );
     }
 
     #[test]
@@ -494,11 +554,12 @@ data: [DONE]"#;
 
         let turn = parse_assistant_turn(&body).unwrap();
 
-        let ProviderTurn::ToolCalls { calls, .. } = turn else {
+        let ProviderTurn::ToolCalls { items } = turn else {
             panic!("expected function call turn");
         };
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments(), "x".repeat((16 * 1024) + 1));
+        assert!(
+            matches!(items.as_slice(), [TranscriptItem::ToolCall(call)] if call.arguments() == "x".repeat((16 * 1024) + 1))
+        );
     }
 
     #[test]
@@ -511,18 +572,12 @@ data: {"type":"response.completed"}"#;
 
         let turn = parse_assistant_turn(text).unwrap();
 
-        let ProviderTurn::ToolCalls { state, calls } = turn else {
+        let ProviderTurn::ToolCalls { items } = turn else {
             panic!("expected function call turn");
         };
-        assert_eq!(state.output_items.len(), 1);
-        assert_eq!(
-            state.output_items[0]["arguments"],
-            r#"{"path":"README.md"}"#
+        assert!(
+            matches!(items.as_slice(), [TranscriptItem::ToolCall(call)] if call.arguments() == r#"{"path":"README.md"}"#)
         );
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id(), "call_1");
-        assert_eq!(calls[0].name(), "ferricode_read_file");
-        assert_eq!(calls[0].arguments(), r#"{"path":"README.md"}"#);
     }
 
     #[test]
@@ -532,14 +587,61 @@ data: {"type":"response.completed"}"#;
 
         let turn = parse_assistant_turn(text).unwrap();
 
-        let ProviderTurn::ToolCalls { state, calls } = turn else {
+        let ProviderTurn::ToolCalls { items } = turn else {
             panic!("expected function call turn");
         };
-        assert_eq!(state.output_items.len(), 1);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id(), "call_1");
-        assert_eq!(calls[0].name(), "ferricode_read_file");
-        assert_eq!(calls[0].arguments(), r#"{"path":"README.md"}"#);
+        assert!(
+            matches!(items.as_slice(), [TranscriptItem::ToolCall(call)] if call.id() == "call_1")
+        );
+    }
+
+    /// A function call at output index one still represents one backend item.
+    /// The added and done events describe the same call, and sparse indexes
+    /// must not manufacture a second call or a placeholder at index zero.
+    #[test]
+    fn streamed_function_call_at_sparse_output_index_is_not_duplicated() {
+        let text = r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":""}}
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}}
+data: {"type":"response.completed"}"#;
+
+        let turn = parse_assistant_turn(text).unwrap();
+
+        assert!(
+            matches!(turn, ProviderTurn::ToolCalls { items } if matches!(items.as_slice(), [TranscriptItem::ToolCall(call)] if call.id() == "call_1"))
+        );
+    }
+
+    /// Desynchronized done-event indexes must not make core execute the same
+    /// backend call twice, even though both output items otherwise parse.
+    #[test]
+    fn streamed_duplicate_function_call_id_is_a_protocol_error() {
+        let text = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}}
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}}
+data: {"type":"response.completed"}"#;
+
+        let error = parse_assistant_turn(text).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "duplicate function call id `call_1` in one response"
+        );
+    }
+
+    /// A textless assistant message is backend state rather than a malformed
+    /// turn, so a sibling tool call remains executable and the message survives replay.
+    #[test]
+    fn tool_call_turn_preserves_empty_assistant_message_as_opaque() {
+        let text = r#"{"output":[{"type":"function_call","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"},{"type":"message","role":"assistant","content":[]}]}"#;
+
+        let ProviderTurn::ToolCalls { items } = parse_assistant_turn(text).unwrap() else {
+            panic!("expected function call turn");
+        };
+
+        assert!(matches!(
+            items.as_slice(),
+            [TranscriptItem::ToolCall(call), TranscriptItem::ProviderOpaque { provider: PROVIDER_NAME, payload }]
+                if call.id() == "call_1" && payload["type"] == "message"
+        ));
     }
 
     #[test]
@@ -586,11 +688,12 @@ data: {{\"type\":\"response.completed\"}}",
 
         let turn = parse_assistant_turn(&body).unwrap();
 
-        let ProviderTurn::ToolCalls { calls, .. } = turn else {
+        let ProviderTurn::ToolCalls { items } = turn else {
             panic!("expected function call turn");
         };
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments(), "x".repeat((16 * 1024) + 1));
+        assert!(
+            matches!(items.as_slice(), [TranscriptItem::ToolCall(call)] if call.arguments() == "x".repeat((16 * 1024) + 1))
+        );
     }
 
     /// The buffer guard is cumulative across deltas: two deltas that are each

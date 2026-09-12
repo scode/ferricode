@@ -1,4 +1,4 @@
-//! Implements Codex Responses API requests and provider state transitions.
+//! Implements Codex Responses API requests from core-owned transcripts.
 //!
 //! This module is the boundary between Ferricode's provider contract and Codex's
 //! backend protocol. It builds fixed request shapes and decides when stored
@@ -9,7 +9,7 @@
 //! policy.
 
 use crate::{
-    OpenAiCodexError, TokenSet,
+    OpenAiCodexError, PROVIDER_NAME, TokenSet,
     auth::{
         CODEX_ORIGINATOR, DEFAULT_ISSUER, now_unix_ms, refresh_access_token, token_needs_refresh,
         tokens_from_response,
@@ -18,8 +18,8 @@ use crate::{
     store::{default_auth_path, read_auth_file, write_auth_file},
 };
 use ferricode_core::{
-    ModelProvider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderTurn, ToolOutput,
-    built_in_tools,
+    ModelProvider, ProviderError, ProviderErrorKind, ProviderFuture, ProviderRequest, ProviderTurn,
+    Transcript, TranscriptItem, built_in_tools,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
@@ -77,8 +77,9 @@ impl OpenAiCodexProvider {
     /// core harness. Production requests should go through `ferricode-core` so
     /// built-in tool calls can be executed.
     pub async fn respond(&self, request: &ProviderRequest) -> Result<String, ProviderError> {
-        match self.start(request).await? {
-            ProviderTurn::Final(text) => Ok(text),
+        let transcript = Transcript::for_request(request);
+        match self.complete(request, &transcript).await? {
+            ProviderTurn::Final { text, .. } => Ok(text),
             ProviderTurn::ToolCalls { .. } => Err(ProviderError::new(
                 ProviderErrorKind::Protocol,
                 "model requested built-in tools outside the core harness",
@@ -121,33 +122,22 @@ impl OpenAiCodexProvider {
 }
 
 impl ModelProvider for OpenAiCodexProvider {
-    type State = OpenAiCodexState;
-
-    async fn start<'a>(
+    fn complete<'a>(
         &'a self,
         request: &'a ProviderRequest,
-    ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-        let tokens = self.authenticated_tokens().await?;
-        let body = build_responses_body(request);
-        let turn = self
-            .send_responses_request(&tokens, &body)
-            .await
-            .map_err(ProviderError::from)?;
-        Ok(attach_request_context(turn, &body))
-    }
-
-    async fn resume<'a>(
-        &'a self,
-        state: Self::State,
-        tool_outputs: &'a [ToolOutput],
-    ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-        let tokens = self.authenticated_tokens().await?;
-        let body = build_tool_outputs_body(state, tool_outputs);
-        let turn = self
-            .send_responses_request(&tokens, &body)
-            .await
-            .map_err(ProviderError::from)?;
-        Ok(attach_request_context(turn, &body))
+        transcript: &'a Transcript,
+    ) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let tokens = self.authenticated_tokens().await?;
+            let body = build_responses_body(request, transcript);
+            log_request_item_counts(transcript);
+            let turn = self
+                .send_responses_request(&tokens, &body)
+                .await
+                .map_err(ProviderError::from)?;
+            tracing::debug!(output_item_types = ?turn_item_types(&turn), "received OpenAI Codex response items");
+            Ok(turn)
+        })
     }
 }
 
@@ -156,7 +146,7 @@ impl OpenAiCodexProvider {
         &self,
         tokens: &TokenSet,
         body: &Value,
-    ) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+    ) -> Result<ProviderTurn, OpenAiCodexError> {
         let response = self
             .client
             .post(&self.backend_url)
@@ -175,36 +165,17 @@ impl OpenAiCodexProvider {
     }
 }
 
-/// OpenAI response output items needed to resume after tool execution.
+/// Builds the fixed Responses request by translating the complete transcript.
 ///
-/// `instructions` rides along because `resume` receives no request and each
-/// continuation is a fresh stateless request (`"store": false`) that must
-/// restate the system prompt itself; the harness owns that prompt
-/// (`ProviderRequest::instructions`) and this provider only relays it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct OpenAiCodexState {
-    pub(crate) input_items: Vec<Value>,
-    pub(crate) output_items: Vec<Value>,
-    pub(crate) instructions: String,
-}
-
-/// Builds the hardcoded bootstrap Responses body.
-pub fn build_responses_body(request: &ProviderRequest) -> Value {
+/// Every request is stateless (`"store": false`), including continuation
+/// requests. Opaque reasoning is therefore replayed here for this provider
+/// only, with its top-level response id removed because it is not valid input.
+pub fn build_responses_body(request: &ProviderRequest, transcript: &Transcript) -> Value {
     json!({
         "model": MODEL,
         "instructions": request.instructions(),
         "stream": true,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": format!("Working directory: {}\n\n{}", request.working_directory().display(), request.prompt())
-                    }
-                ]
-            }
-        ],
+        "input": transcript.items().iter().filter_map(render_transcript_item).collect::<Vec<_>>(),
         "tools": built_in_tool_schemas(),
         "tool_choice": "auto",
         "parallel_tool_calls": false,
@@ -215,66 +186,86 @@ pub fn build_responses_body(request: &ProviderRequest) -> Value {
     })
 }
 
-fn build_tool_outputs_body(state: OpenAiCodexState, tool_outputs: &[ToolOutput]) -> Value {
-    let mut input = state.input_items;
-    input.extend(state.output_items.into_iter().map(strip_provider_item_ids));
-    input.extend(tool_outputs.iter().map(|output| {
-        json!({
-            "type": "function_call_output",
-            "call_id": output.call_id(),
-            "output": output.output(),
-        })
-    }));
-
-    json!({
-        "model": MODEL,
-        "instructions": state.instructions,
-        "stream": true,
-        "input": input,
-        "tools": built_in_tool_schemas(),
-        "tool_choice": "auto",
-        "parallel_tool_calls": false,
-        "reasoning": {
-            "effort": REASONING_EFFORT
-        },
-        "store": false
-    })
-}
-
-fn response_input_items(body: &Value) -> Vec<Value> {
-    body.get("input")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// Copies what the next request must repeat (the input items sent so far and
-/// the system prompt) from the body just sent into the resume state.
+/// Maps each renderable transcript item one-to-one into request input order.
 ///
-/// The parser that produced `turn` only sees the response, so it cannot know
-/// what was asked; reading both values back from the request body keeps a
-/// single source of truth for what the backend has been told.
-fn attach_request_context(
-    turn: ProviderTurn<OpenAiCodexState>,
-    body: &Value,
-) -> ProviderTurn<OpenAiCodexState> {
-    match turn {
-        ProviderTurn::ToolCalls { mut state, calls } => {
-            state.input_items = response_input_items(body);
-            // Every body is built by this module, so a missing key is a bug;
-            // falling back to "" would send a request with no system prompt
-            // and nothing would notice, which is the failure this field exists
-            // to rule out.
-            state.instructions = body["instructions"]
-                .as_str()
-                .expect("request bodies built by this module always carry instructions")
-                .to_string();
-            ProviderTurn::ToolCalls { state, calls }
+/// The only elision is an opaque item tagged for another provider, because
+/// core preserves all opaque state while each provider alone decides what it
+/// can replay.
+fn render_transcript_item(item: &TranscriptItem) -> Option<Value> {
+    match item {
+        TranscriptItem::UserMessage { text } => Some(json!({
+            "role": "user", "content": [{ "type": "input_text", "text": text }],
+        })),
+        TranscriptItem::AssistantMessage { text } => Some(json!({
+            "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": text }],
+        })),
+        TranscriptItem::ToolCall(call) => Some(json!({
+            "type": "function_call", "call_id": call.id(), "name": call.name(), "arguments": call.arguments(),
+        })),
+        TranscriptItem::ToolResult(output) => Some(json!({
+            "type": "function_call_output", "call_id": output.call_id(), "output": output.output(),
+        })),
+        TranscriptItem::ProviderOpaque { provider, payload } if *provider == PROVIDER_NAME => {
+            Some(strip_provider_item_ids(payload.clone()))
         }
-        ProviderTurn::Final(text) => ProviderTurn::Final(text),
+        TranscriptItem::ProviderOpaque { .. } => None,
     }
 }
 
+/// Emits a compact breakdown of the core vocabulary before it reaches the wire.
+///
+/// Keeping this separate from rendering makes diagnostics describe the full
+/// transcript, including foreign opaque entries that this provider will skip.
+fn log_request_item_counts(transcript: &Transcript) {
+    let mut counts = [0; 5];
+    for item in transcript.items() {
+        counts[match item {
+            TranscriptItem::UserMessage { .. } => 0,
+            TranscriptItem::AssistantMessage { .. } => 1,
+            TranscriptItem::ToolCall(_) => 2,
+            TranscriptItem::ToolResult(_) => 3,
+            TranscriptItem::ProviderOpaque { .. } => 4,
+        }] += 1;
+    }
+    tracing::debug!(
+        user_messages = counts[0],
+        assistant_messages = counts[1],
+        tool_calls = counts[2],
+        tool_results = counts[3],
+        provider_opaque = counts[4],
+        "sending OpenAI Codex transcript items"
+    );
+}
+
+/// Names transcript item kinds for response diagnostics without logging payloads.
+///
+/// Opaque items report their provider wire `type` when available so unknown
+/// backend state can be identified without exposing its contents.
+fn turn_item_types(turn: &ProviderTurn) -> Vec<String> {
+    let items = match turn {
+        ProviderTurn::Final { items, .. } | ProviderTurn::ToolCalls { items } => items,
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            TranscriptItem::UserMessage { .. } => "user_message".to_string(),
+            TranscriptItem::AssistantMessage { .. } => "message".to_string(),
+            TranscriptItem::ToolCall(_) => "function_call".to_string(),
+            TranscriptItem::ToolResult(_) => "function_call_output".to_string(),
+            TranscriptItem::ProviderOpaque { payload, .. } => payload
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing-type>")
+                .to_string(),
+        })
+        .collect()
+}
+
+/// Removes a top-level output item `id` before replaying it as Responses input.
+///
+/// The API rejects that item id as input. This behavior comes from the earlier
+/// state-based implementation; whether reasoning items survive this path has
+/// not been verified live because the backend returned none during the check.
 fn strip_provider_item_ids(mut item: Value) -> Value {
     if let Some(map) = item.as_object_mut() {
         map.remove("id");
@@ -301,7 +292,7 @@ fn built_in_tool_schemas() -> Value {
 
 async fn read_assistant_response(
     mut response: reqwest::Response,
-) -> Result<ProviderTurn<OpenAiCodexState>, OpenAiCodexError> {
+) -> Result<ProviderTurn, OpenAiCodexError> {
     if !response
         .headers()
         .get(CONTENT_TYPE)
@@ -341,7 +332,7 @@ fn build_codex_headers(tokens: &TokenSet) -> Result<HeaderMap, OpenAiCodexError>
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use ferricode_core::ProviderRequest;
+    use ferricode_core::{ProviderRequest, ToolCall, ToolOutput, Transcript, TranscriptItem};
     use serde_json::json;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -352,8 +343,12 @@ mod tests {
     #[test]
     fn response_body_uses_hardcoded_model_and_effort() {
         let request = ProviderRequest::new("summarize this repository", "/repo");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptItem::UserMessage {
+            text: "Working directory: /repo\n\nsummarize this repository".to_string(),
+        });
 
-        let body = build_responses_body(&request);
+        let body = build_responses_body(&request, &transcript);
 
         assert_eq!(body["model"], MODEL);
         assert_eq!(body["instructions"], ferricode_core::DEFAULT_INSTRUCTIONS);
@@ -390,27 +385,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_outputs_body_preserves_prior_items() {
-        let state = OpenAiCodexState {
-            instructions: ferricode_core::DEFAULT_INSTRUCTIONS.to_string(),
-            input_items: vec![json!({
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Working directory: /repo\n\nread it"}]
-            })],
-            output_items: vec![json!({
-                "type": "function_call",
-                "id": "fc_123",
-                "call_id": "call_1",
-                "name": "ferricode_read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            })],
-        };
-        let outputs = vec![ToolOutput::new(
+    fn transcript_body_preserves_prior_items() {
+        let request = ProviderRequest::new("read it", "/repo");
+        let output = ToolOutput::new(
             "call_1",
             r#"{"ok":true,"path":"README.md","content":"hi","truncated":false}"#,
-        )];
-
-        let body = build_tool_outputs_body(state, &outputs);
+        );
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptItem::UserMessage {
+            text: "Working directory: /repo\n\nread it".to_string(),
+        });
+        transcript.push(TranscriptItem::ToolCall(ToolCall::new(
+            "call_1",
+            "ferricode_read_file",
+            r#"{"path":"README.md"}"#,
+        )));
+        transcript.push(TranscriptItem::ToolResult(output.clone()));
+        let body = build_responses_body(&request, &transcript);
 
         assert_eq!(body["input"].as_array().unwrap().len(), 3);
         assert_eq!(body["input"][0]["role"], "user");
@@ -418,15 +409,36 @@ mod tests {
         assert!(body["input"][1].get("id").is_none());
         assert_eq!(body["input"][2]["type"], "function_call_output");
         assert_eq!(body["input"][2]["call_id"], "call_1");
-        assert_eq!(body["input"][2]["output"], outputs[0].output());
+        assert_eq!(body["input"][2]["output"], output.output());
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
         assert_eq!(body["instructions"], ferricode_core::DEFAULT_INSTRUCTIONS);
     }
 
+    /// Foreign opaque state belongs to its producer, so this provider must not
+    /// leak it into an OpenAI request even though core preserved it in order.
+    #[test]
+    fn transcript_body_skips_foreign_opaque_items() {
+        let request = ProviderRequest::new("read it", "/repo");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptItem::UserMessage {
+            text: "Working directory: /repo\n\nread it".to_string(),
+        });
+        transcript.push(TranscriptItem::ProviderOpaque {
+            provider: "other-provider",
+            payload: json!({ "type": "reasoning", "secret_state": "not ours" }),
+        });
+
+        let body = build_responses_body(&request, &transcript);
+
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert!(body.to_string().contains("Working directory: /repo"));
+        assert!(!body.to_string().contains("secret_state"));
+    }
+
     #[tokio::test]
-    async fn provider_resume_posts_tool_outputs_and_returns_next_turn() {
+    async fn provider_complete_posts_transcript_tool_output_and_returns_next_turn() {
         let (base_url, requests) = spawn_test_server(vec![TestResponse::json(
-            r#"{"output":[{"content":[{"type":"output_text","text":"done"}]}]}"#,
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}"#,
         )])
         .await;
         let dir = tempdir().unwrap();
@@ -438,44 +450,47 @@ mod tests {
         .unwrap();
         let provider =
             OpenAiCodexProvider::with_urls(&path, &base_url, format!("{base_url}/codex/responses"));
-        let state = OpenAiCodexState {
-            instructions: ferricode_core::DEFAULT_INSTRUCTIONS.to_string(),
-            input_items: vec![json!({
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Working directory: /repo\n\nread it"}]
-            })],
-            output_items: vec![json!({
-                "type": "function_call",
-                "id": "fc_123",
-                "call_id": "call_1",
-                "name": "ferricode_read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            })],
-        };
-        let outputs = vec![ToolOutput::new(
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptItem::UserMessage {
+            text: "Working directory: /repo\n\nread it".to_string(),
+        });
+        transcript.push(TranscriptItem::ProviderOpaque {
+            provider: PROVIDER_NAME,
+            payload: json!({ "type": "reasoning", "id": "rs_123" }),
+        });
+        transcript.push(TranscriptItem::ToolCall(ToolCall::new(
+            "call_1",
+            "ferricode_read_file",
+            r#"{"path":"README.md"}"#,
+        )));
+        transcript.push(TranscriptItem::ToolResult(ToolOutput::new(
             "call_1",
             r#"{"ok":true,"path":"README.md","content":"hi","truncated":false}"#,
-        )];
+        )));
 
-        let turn = provider.resume(state, &outputs).await.unwrap();
+        let turn = provider
+            .complete(&ProviderRequest::new("read it", "/repo"), &transcript)
+            .await
+            .unwrap();
 
-        assert_eq!(turn, ProviderTurn::Final("done".to_string()));
+        assert!(matches!(turn, ProviderTurn::Final { text, .. } if text == "done"));
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("Working directory: /repo"));
         assert!(requests[0].contains(r#""type":"function_call_output""#));
         assert!(requests[0].contains(r#""call_id":"call_1""#));
         assert!(requests[0].contains(r#""output":"{\"ok\":true,"#));
-        assert!(!requests[0].contains(r#""id":"fc_123""#));
+        assert!(requests[0].contains(r#""type":"reasoning""#));
+        assert!(!requests[0].contains(r#""id":"rs_123""#));
     }
 
     #[tokio::test]
-    async fn provider_start_state_preserves_input_for_resume() {
+    async fn provider_transcript_preserves_input_for_next_request() {
         let (base_url, requests) = spawn_test_server(vec![
             TestResponse::json(
                 r#"{"output":[{"type":"function_call","id":"fc_123","call_id":"call_1","name":"ferricode_read_file","arguments":"{\"path\":\"README.md\"}"}]}"#,
             ),
-            TestResponse::json(r#"{"output":[{"content":[{"type":"output_text","text":"done"}]}]}"#),
+            TestResponse::json(r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}"#),
         ])
         .await;
         let dir = tempdir().unwrap();
@@ -489,25 +504,33 @@ mod tests {
             OpenAiCodexProvider::with_urls(&path, &base_url, format!("{base_url}/codex/responses"));
         let request = ProviderRequest::new("read it", "/repo");
 
-        let ProviderTurn::ToolCalls { state, calls } = provider.start(&request).await.unwrap()
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptItem::UserMessage {
+            text: "Working directory: /repo\n\nread it".to_string(),
+        });
+        let ProviderTurn::ToolCalls { items } =
+            provider.complete(&request, &transcript).await.unwrap()
         else {
             panic!("expected tool call turn");
         };
-        assert_eq!(calls.len(), 1);
-        let outputs = vec![ToolOutput::new(
+        assert!(
+            matches!(items.as_slice(), [TranscriptItem::ToolCall(call)] if call.id() == "call_1")
+        );
+        transcript.extend(items);
+        transcript.push(TranscriptItem::ToolResult(ToolOutput::new(
             "call_1",
             r#"{"ok":true,"path":"README.md","content":"hi","truncated":false}"#,
-        )];
-        let turn = provider.resume(state, &outputs).await.unwrap();
+        )));
+        let turn = provider.complete(&request, &transcript).await.unwrap();
 
-        assert_eq!(turn, ProviderTurn::Final("done".to_string()));
+        assert!(matches!(turn, ProviderTurn::Final { text, .. } if text == "done"));
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains("Working directory: /repo"));
         assert!(requests[1].contains("read it"));
         assert!(requests[1].contains(r#""type":"function_call_output""#));
-        // The resume request must repeat the system prompt the first turn sent,
-        // not a placeholder; only `attach_request_context` carries it across.
+        // A stateless provider must rebuild the system prompt from the request,
+        // rather than relying on the first request having left server state.
         assert!(requests[1].contains(ferricode_core::DEFAULT_INSTRUCTIONS));
     }
 
@@ -528,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn provider_success_sends_expected_request() {
         let (base_url, requests) = spawn_test_server(vec![TestResponse::json(
-            r#"{"output":[{"content":[{"type":"output_text","text":"assistant"}]}]}"#,
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant"}]}]}"#,
         )])
         .await;
         let dir = tempdir().unwrap();

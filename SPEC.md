@@ -33,9 +33,11 @@ The harness request type is not the provider request type. `HarnessRequest` is t
 providers receive the narrower model-facing request that the harness chooses to build from it. Those types may look the
 same during bootstrap, but they must not be treated as interchangeable.
 
-The bootstrap provider interface is intentionally small: one prompt and working-directory context in, one assistant text
-response out, with a narrow exception for core-owned built-in tools. Do not add registries, model selection, public
-streaming APIs, MCP, mutation tools, or provider fallback until the harness actually needs them.
+Core owns a provider-neutral transcript. Providers render that complete transcript into their wire format on every
+request and may attach opaque, provider-tagged items that core replays in order without inspecting; providers skip
+opaque items tagged for other providers; the provider trait is object-safe so front ends can choose a provider
+dynamically. Do not add registries, model selection, public streaming APIs, MCP, mutation tools, or provider fallback
+until the harness actually needs them.
 
 Core owns built-in tool orchestration and local tool policy. The first supported tools are read-only filesystem tools:
 directory listing and UTF-8 file reading under the request working directory. Provider crates may expose those tools
