@@ -13,11 +13,14 @@ mod responses;
 mod sse;
 mod store;
 
+/// Tag on every `ProviderOpaque` item this crate produces and the only tag it replays.
+pub(crate) const PROVIDER_NAME: &str = "openai-codex";
+
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub use auth::{PkceCodes, authenticate_openai_codex, build_authorize_url};
-pub use responses::{OpenAiCodexProvider, OpenAiCodexState, build_responses_body};
+pub use responses::{OpenAiCodexProvider, build_responses_body};
 pub use sse::parse_assistant_text;
 pub use store::{
     AuthFile, OpenAiCodexAuth, TokenSet, default_auth_path, read_auth_file, write_auth_file,

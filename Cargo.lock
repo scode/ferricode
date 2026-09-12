@@ -333,6 +333,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tracing",
  "url",
  "webbrowser",
 ]

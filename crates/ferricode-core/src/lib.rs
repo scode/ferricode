@@ -6,10 +6,14 @@
 //! stay here so every front end gets the same behavior.
 
 mod tools;
+mod transcript;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use tools::execute_tool_calls;
 pub use tools::{ToolCall, ToolDefinition, ToolOutput, built_in_tools};
+pub use transcript::{Transcript, TranscriptItem};
 
 const MAX_TOOL_TURNS: usize = 32;
 
@@ -149,13 +153,19 @@ impl ProviderRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessResponse {
     summary: String,
+    transcript: Transcript,
 }
 
 impl HarnessResponse {
-    /// Creates a response summary meant for display, logging, or later execution.
-    pub fn new(summary: impl Into<String>) -> Self {
+    /// Creates the final response and preserves the full conversation for UIs.
+    ///
+    /// This constructor is private because only the harness can promise that
+    /// the transcript contains the user request, provider turns, and tool
+    /// results in execution order.
+    fn new(summary: impl Into<String>, transcript: Transcript) -> Self {
         Self {
             summary: summary.into(),
+            transcript,
         }
     }
 
@@ -163,26 +173,43 @@ impl HarnessResponse {
     pub fn summary(&self) -> &str {
         &self.summary
     }
+
+    /// Returns the ordered conversation that produced this summary.
+    pub fn transcript(&self) -> &Transcript {
+        &self.transcript
+    }
 }
 
 /// One model-request turn produced by a provider.
 ///
-/// Providers either return final assistant text or ask the harness to execute
-/// local tools and resume the same model interaction. The state value is opaque
-/// to the core crate; it lets provider crates preserve backend-specific
-/// transcript items that must be sent back with tool outputs.
+/// Providers return the transcript entries they produced alongside either
+/// final text or tool calls. Core appends `items` exactly as supplied before it
+/// returns or runs calls; a provider must therefore put opaque reasoning before
+/// the calls it explains and retain backend output order within the vector.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderTurn<State> {
-    /// The provider has completed the request with user-facing assistant text.
-    Final(String),
+pub enum ProviderTurn {
+    /// The provider completed the request with user-facing assistant text.
+    ///
+    /// Core rejects turns whose `items` lack the corresponding
+    /// `AssistantMessage`. Items may also contain provider-only state that has
+    /// to survive a future turn.
+    Final {
+        text: String,
+        items: Vec<TranscriptItem>,
+    },
     /// The provider needs core-owned tools before it can continue.
     ToolCalls {
-        /// Opaque provider state to pass back on the continuation request.
-        state: State,
-        /// Tool calls requested by the model.
-        calls: Vec<ToolCall>,
+        /// Entries to append before core executes the derived calls.
+        ///
+        /// Providers include every entry, opaque state included, in backend
+        /// output order. Core derives the calls from the `ToolCall` entries.
+        items: Vec<TranscriptItem>,
     },
 }
+
+/// The boxed future used by the object-safe provider boundary.
+pub type ProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProviderTurn, ProviderError>> + Send + 'a>>;
 
 /// A provider that can drive one model interaction through core-owned tools.
 ///
@@ -190,22 +217,18 @@ pub enum ProviderTurn<State> {
 /// model selection, provider fallback, or MCP. It only gives the harness enough
 /// structure to run local built-in tools and hand their outputs back to the
 /// same provider.
-pub trait ModelProvider {
-    /// Opaque provider transcript state preserved across tool turns.
-    type State: Send;
-
-    /// Starts a model interaction from the harness-selected request.
-    fn start<'a>(
+pub trait ModelProvider: Send + Sync {
+    /// Renders the complete transcript and returns the next model turn.
+    ///
+    /// Providers are stateless between calls: they must derive all backend
+    /// input from `request` and `transcript`, skipping opaque entries owned by
+    /// other providers. They must not retain a hidden continuation token or
+    /// assume this call follows an earlier call on the same instance.
+    fn complete<'a>(
         &'a self,
         request: &'a ProviderRequest,
-    ) -> impl std::future::Future<Output = Result<ProviderTurn<Self::State>, ProviderError>> + Send + 'a;
-
-    /// Continues a model interaction after the harness has run requested tools.
-    fn resume<'a>(
-        &'a self,
-        state: Self::State,
-        tool_outputs: &'a [ToolOutput],
-    ) -> impl std::future::Future<Output = Result<ProviderTurn<Self::State>, ProviderError>> + Send + 'a;
+        transcript: &'a Transcript,
+    ) -> ProviderFuture<'a>;
 }
 
 /// Coarse classification of a provider failure, so front ends can decide what to do
@@ -282,29 +305,56 @@ impl Harness {
     pub async fn handle(
         &self,
         request: &HarnessRequest,
-        provider: &impl ModelProvider,
+        provider: &dyn ModelProvider,
     ) -> Result<HarnessResponse, ProviderError> {
         let provider_request = ProviderRequest::new(request.prompt(), request.working_directory());
-        let mut turn = provider.start(&provider_request).await?;
+        let mut transcript = Transcript::for_request(&provider_request);
+        let mut tool_turns = 0;
 
-        for _ in 0..MAX_TOOL_TURNS {
+        loop {
+            let turn = provider.complete(&provider_request, &transcript).await?;
             match turn {
-                ProviderTurn::Final(summary) => return Ok(HarnessResponse::new(summary)),
-                ProviderTurn::ToolCalls { state, calls } => {
+                ProviderTurn::Final { text, items } => {
+                    if !items
+                        .iter()
+                        .any(|item| matches!(item, TranscriptItem::AssistantMessage { .. }))
+                    {
+                        return Err(ProviderError::new(
+                            ProviderErrorKind::Protocol,
+                            "provider returned a final turn with no assistant message",
+                        ));
+                    }
+                    transcript.extend(items);
+                    return Ok(HarnessResponse::new(text, transcript));
+                }
+                ProviderTurn::ToolCalls { items } => {
+                    if tool_turns == MAX_TOOL_TURNS {
+                        return Err(ProviderError::new(
+                            ProviderErrorKind::Other,
+                            format!(
+                                "model exceeded the built-in tool turn limit of {MAX_TOOL_TURNS}"
+                            ),
+                        ));
+                    }
+                    let calls = items
+                        .iter()
+                        .filter_map(|item| match item {
+                            TranscriptItem::ToolCall(call) => Some(call.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if calls.is_empty() {
+                        return Err(ProviderError::new(
+                            ProviderErrorKind::Protocol,
+                            "provider returned a tool-call turn with no tool calls",
+                        ));
+                    }
+                    tool_turns += 1;
+                    transcript.extend(items);
                     let outputs = execute_tool_calls(&provider_request, calls).await;
-                    turn = provider.resume(state, &outputs).await?;
+                    transcript.extend(outputs.into_iter().map(TranscriptItem::ToolResult));
                 }
             }
-        }
-
-        match turn {
-            ProviderTurn::Final(summary) => Ok(HarnessResponse::new(summary)),
-            // A harness policy limit, not a wire-shape problem, so `Other`
-            // rather than `Protocol`; nothing about the transport is broken.
-            ProviderTurn::ToolCalls { .. } => Err(ProviderError::new(
-                ProviderErrorKind::Other,
-                format!("model exceeded the built-in tool turn limit of {MAX_TOOL_TURNS}"),
-            )),
         }
     }
 }
@@ -337,7 +387,8 @@ impl std::error::Error for HarnessError {}
 mod tests {
     use super::{
         Harness, HarnessError, HarnessRequest, ModelProvider, ProviderError, ProviderErrorKind,
-        ProviderRequest, ProviderTurn, ToolCall, ToolOutput,
+        ProviderFuture, ProviderRequest, ProviderTurn, ToolCall, ToolOutput, Transcript,
+        TranscriptItem,
     };
     use serde_json::Value;
     use std::fs;
@@ -347,49 +398,39 @@ mod tests {
     struct EchoProvider;
 
     impl ModelProvider for EchoProvider {
-        type State = ();
-
-        async fn start<'a>(
+        fn complete<'a>(
             &'a self,
             request: &'a ProviderRequest,
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            Ok(ProviderTurn::Final(format!(
-                "provider saw {} from {}",
-                request.prompt(),
-                request.working_directory().display()
-            )))
-        }
-
-        async fn resume<'a>(
-            &'a self,
-            _state: Self::State,
-            _tool_outputs: &'a [ToolOutput],
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            unreachable!("echo provider never requests tools")
+            _transcript: &'a Transcript,
+        ) -> ProviderFuture<'a> {
+            Box::pin(async move {
+                let text = format!(
+                    "provider saw {} from {}",
+                    request.prompt(),
+                    request.working_directory().display()
+                );
+                Ok(ProviderTurn::Final {
+                    items: vec![TranscriptItem::AssistantMessage { text: text.clone() }],
+                    text,
+                })
+            })
         }
     }
 
     struct FailingProvider;
 
     impl ModelProvider for FailingProvider {
-        type State = ();
-
-        async fn start<'a>(
+        fn complete<'a>(
             &'a self,
             _request: &'a ProviderRequest,
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            Err(ProviderError::new(
-                ProviderErrorKind::Other,
-                "provider failed",
-            ))
-        }
-
-        async fn resume<'a>(
-            &'a self,
-            _state: Self::State,
-            _tool_outputs: &'a [ToolOutput],
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            unreachable!("failing provider never requests tools")
+            _transcript: &'a Transcript,
+        ) -> ProviderFuture<'a> {
+            Box::pin(async {
+                Err(ProviderError::new(
+                    ProviderErrorKind::Other,
+                    "provider failed",
+                ))
+            })
         }
     }
 
@@ -408,33 +449,45 @@ mod tests {
     }
 
     impl ModelProvider for ScriptedProvider {
-        type State = usize;
-
-        async fn start<'a>(
+        fn complete<'a>(
             &'a self,
             _request: &'a ProviderRequest,
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            Ok(ProviderTurn::ToolCalls {
-                state: 0,
-                calls: self.calls[0].clone(),
+            transcript: &'a Transcript,
+        ) -> ProviderFuture<'a> {
+            Box::pin(async move {
+                let last_outputs = transcript
+                    .items()
+                    .rsplit(|item| !matches!(item, TranscriptItem::ToolResult(_)))
+                    .next()
+                    .unwrap();
+                if !last_outputs.is_empty() {
+                    self.outputs.lock().unwrap().push(
+                        last_outputs
+                            .iter()
+                            .filter_map(|item| match item {
+                                TranscriptItem::ToolResult(output) => Some(output.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                }
+                if let Some(calls) = self.calls.get(self.outputs.lock().unwrap().len()) {
+                    let calls = calls.clone();
+                    let items = calls
+                        .iter()
+                        .cloned()
+                        .map(TranscriptItem::ToolCall)
+                        .collect();
+                    Ok(ProviderTurn::ToolCalls { items })
+                } else {
+                    Ok(ProviderTurn::Final {
+                        text: "done".to_string(),
+                        items: vec![TranscriptItem::AssistantMessage {
+                            text: "done".to_string(),
+                        }],
+                    })
+                }
             })
-        }
-
-        async fn resume<'a>(
-            &'a self,
-            state: Self::State,
-            tool_outputs: &'a [ToolOutput],
-        ) -> Result<ProviderTurn<Self::State>, ProviderError> {
-            self.outputs.lock().unwrap().push(tool_outputs.to_vec());
-            let next_state = state + 1;
-            if let Some(calls) = self.calls.get(next_state) {
-                Ok(ProviderTurn::ToolCalls {
-                    state: next_state,
-                    calls: calls.clone(),
-                })
-            } else {
-                Ok(ProviderTurn::Final("done".to_string()))
-            }
         }
     }
 
@@ -518,6 +571,22 @@ mod tests {
         );
     }
 
+    /// The public harness entry point must accept trait objects so front ends
+    /// can choose providers at runtime without carrying provider generics.
+    #[tokio::test]
+    async fn handles_boxed_provider_trait_object() {
+        let dir = tempdir().unwrap();
+        let provider: Box<dyn ModelProvider> = Box::new(EchoProvider);
+        let request = HarnessRequest::new("inspect failures", dir.path()).unwrap();
+
+        let response = Harness::new()
+            .handle(&request, provider.as_ref())
+            .await
+            .unwrap();
+
+        assert!(response.summary().contains("inspect failures"));
+    }
+
     #[tokio::test]
     async fn repository_prompts_are_not_special_cased() {
         let dir = tempdir().unwrap();
@@ -547,6 +616,44 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.to_string(), "provider failed");
+    }
+
+    /// A tool-call turn without a core tool call is malformed provider output,
+    /// so the harness must reject it before it can enter an empty tool cycle.
+    #[tokio::test]
+    async fn tool_call_turn_without_tool_calls_is_a_protocol_error() {
+        struct EmptyToolCallProvider;
+
+        impl ModelProvider for EmptyToolCallProvider {
+            fn complete<'a>(
+                &'a self,
+                _: &'a ProviderRequest,
+                _: &'a Transcript,
+            ) -> ProviderFuture<'a> {
+                Box::pin(async {
+                    Ok(ProviderTurn::ToolCalls {
+                        items: vec![TranscriptItem::ProviderOpaque {
+                            provider: "test",
+                            payload: serde_json::json!({ "type": "reasoning" }),
+                        }],
+                    })
+                })
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let request = HarnessRequest::new("inspect", dir.path()).unwrap();
+
+        let error = Harness::new()
+            .handle(&request, &EmptyToolCallProvider)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+        assert_eq!(
+            error.to_string(),
+            "provider returned a tool-call turn with no tool calls"
+        );
     }
 
     #[tokio::test]
@@ -579,8 +686,161 @@ mod tests {
         let read = parse_output(&outputs[1][0]);
         assert_eq!(read["ok"], true);
         assert_eq!(read["content"], "hello");
+        assert!(matches!(
+            response.transcript().items(),
+            [
+                TranscriptItem::UserMessage { .. },
+                TranscriptItem::ToolCall(list),
+                TranscriptItem::ToolResult(list_result),
+                TranscriptItem::ToolCall(read),
+                TranscriptItem::ToolResult(read_result),
+                TranscriptItem::AssistantMessage { text },
+            ] if list.id() == "list"
+                && list_result.call_id() == "list"
+                && read.id() == "read"
+                && read_result.call_id() == "read"
+                && text == "done"
+        ));
     }
 
+    /// Foreign opaque entries are conversation data, not core policy. This
+    /// proves core preserves them for a later provider to decide whether it can
+    /// consume them instead of silently discarding state it cannot understand.
+    #[tokio::test]
+    async fn replays_foreign_opaque_items_untouched() {
+        struct OpaqueProvider;
+        impl ModelProvider for OpaqueProvider {
+            fn complete<'a>(
+                &'a self,
+                _: &'a ProviderRequest,
+                transcript: &'a Transcript,
+            ) -> ProviderFuture<'a> {
+                Box::pin(async move {
+                    if transcript
+                        .items()
+                        .iter()
+                        .any(|item| matches!(item, TranscriptItem::ToolResult(_)))
+                    {
+                        let opaque = transcript.items().iter().find(|item| {
+                            matches!(
+                                item,
+                                TranscriptItem::ProviderOpaque {
+                                    provider: "other-provider",
+                                    ..
+                                }
+                            )
+                        });
+                        match opaque {
+                            Some(TranscriptItem::ProviderOpaque { payload, .. })
+                                if payload == &serde_json::json!({"reasoning": "opaque"}) =>
+                            {
+                                Ok(ProviderTurn::Final {
+                                    text: "done".to_string(),
+                                    items: vec![TranscriptItem::AssistantMessage {
+                                        text: "done".to_string(),
+                                    }],
+                                })
+                            }
+                            _ => Err(ProviderError::new(
+                                ProviderErrorKind::Protocol,
+                                "core changed a foreign opaque transcript item",
+                            )),
+                        }
+                    } else {
+                        let call =
+                            ToolCall::new("list", "ferricode_list_directory", r#"{"path":"."}"#);
+                        Ok(ProviderTurn::ToolCalls {
+                            items: vec![
+                                TranscriptItem::ProviderOpaque {
+                                    provider: "other-provider",
+                                    payload: serde_json::json!({"reasoning": "opaque"}),
+                                },
+                                TranscriptItem::ToolCall(call),
+                            ],
+                        })
+                    }
+                })
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let request = HarnessRequest::new("inspect", dir.path()).unwrap();
+        let response = Harness::new()
+            .handle(&request, &OpaqueProvider)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(response.transcript().items()[1], TranscriptItem::ProviderOpaque { provider: "other-provider", ref payload } if payload == &serde_json::json!({"reasoning": "opaque"}))
+        );
+    }
+
+    /// A final turn needs an assistant message in its replayable transcript,
+    /// even when the provider also returns opaque backend state. Otherwise a
+    /// later provider request loses the assistant response that completed it.
+    #[tokio::test]
+    async fn final_turn_without_assistant_message_is_a_protocol_error() {
+        struct OpaqueFinalProvider;
+
+        impl ModelProvider for OpaqueFinalProvider {
+            fn complete<'a>(
+                &'a self,
+                _: &'a ProviderRequest,
+                _: &'a Transcript,
+            ) -> ProviderFuture<'a> {
+                Box::pin(async {
+                    Ok(ProviderTurn::Final {
+                        text: "done".to_string(),
+                        items: vec![TranscriptItem::ProviderOpaque {
+                            provider: "test",
+                            payload: serde_json::json!({ "type": "reasoning" }),
+                        }],
+                    })
+                })
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let request = HarnessRequest::new("inspect", dir.path()).unwrap();
+
+        let error = Harness::new()
+            .handle(&request, &OpaqueFinalProvider)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+        assert_eq!(
+            error.to_string(),
+            "provider returned a final turn with no assistant message"
+        );
+    }
+
+    /// Exactly 32 tool-call turns must succeed before the final response.
+    /// Together with the 33-turn rejection test, this pins both sides of the
+    /// rewritten loop counter: an off-by-one in either direction could pass a
+    /// single boundary test.
+    #[tokio::test]
+    async fn tool_loop_limit_allows_exactly_32_turns() {
+        let dir = tempdir().unwrap();
+        let calls = (0..32).map(|index| {
+            vec![ToolCall::new(
+                format!("call-{index}"),
+                "ferricode_list_directory",
+                r#"{"path":"."}"#,
+            )]
+        });
+        let provider = ScriptedProvider::new(calls);
+        let request = HarnessRequest::new("loop", dir.path()).unwrap();
+
+        let response = Harness::new().handle(&request, &provider).await.unwrap();
+
+        assert_eq!(response.summary(), "done");
+        assert_eq!(provider.outputs.lock().unwrap().len(), 32);
+    }
+
+    /// The 33rd tool-call turn must fail before execution. Together with the
+    /// 32-turn success test, this pins both sides of the rewritten loop counter:
+    /// an off-by-one in either direction could pass a single boundary test.
     #[tokio::test]
     async fn tool_loop_limit_fails_clearly() {
         let dir = tempdir().unwrap();
