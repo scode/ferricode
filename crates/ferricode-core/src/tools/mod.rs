@@ -5,14 +5,25 @@
 //! filesystem policy, output shape, and failure behavior.
 //! This module is the single source of truth for the definitions that providers
 //! translate into their wire formats.
+//!
+//! Tool execution is asynchronous so slow or blocking local work never stalls
+//! the executor. Calls within one turn run sequentially, in input order, and
+//! implementations must not perform blocking work such as synchronous
+//! standard-library filesystem access or `std::thread::sleep`. One
+//! consequence future tool authors need to know: `tokio::fs` runs each
+//! operation on the blocking pool, and dropping a tool future (the harness
+//! call being cancelled) does not cancel an in-flight operation. Harmless for
+//! the read-only tools here; a write or shell tool must not assume that
+//! dropping its future stops the side effect.
 
 mod list_directory;
 mod read_file;
 
 use crate::ProviderRequest;
 use serde_json::{Value, json};
-use std::fs;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 
 /// Argument schema shared by the filesystem tools: one relative `path` string
 /// and nothing else.
@@ -33,9 +44,18 @@ pub(super) const PATH_ARGUMENTS_SCHEMA: &str = r#"{
   "additionalProperties": false
 }"#;
 
-/// The entry point of one built-in tool: JSON argument text in, tool JSON or a
-/// model-facing error out.
-type RunFn = fn(&ProviderRequest, &str) -> Result<Value, ToolError>;
+/// The in-flight execution of one tool call.
+///
+/// Boxed because the registry stores plain function pointers, and a function
+/// pointer cannot name the anonymous future type an `async fn` returns. `Send`
+/// so the harness future stays `Send` for multi-threaded executors.
+pub(super) type ToolFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'a>>;
+
+/// The entry point of one built-in tool: JSON argument text in, a future
+/// resolving to tool JSON or a model-facing error out. Each tool module wraps
+/// its `async fn run` in a small adapter with this signature.
+type RunFn = for<'a> fn(&'a ProviderRequest, &'a str) -> ToolFuture<'a>;
 
 /// Provider-neutral description of one built-in tool: what it is called, what
 /// the model should read to decide when to use it, the JSON Schema of its
@@ -159,7 +179,16 @@ impl ToolOutput {
     }
 }
 
-pub(crate) fn execute_tool_calls(
+/// Executes one turn's calls one at a time, in input order.
+///
+/// Sequential execution is a deliberate choice, not a constraint of the
+/// provider protocol: outputs are matched to calls by id, so running calls
+/// concurrently would be protocol-safe. It is kept sequential so the async
+/// conversion only moves I/O off the executor thread and leaves observable
+/// behavior, including the order in which side effects of future tools
+/// happen, as it was. Revisit if a provider ever issues several independent
+/// calls per turn.
+pub(crate) async fn execute_tool_calls(
     request: &ProviderRequest,
     calls: Vec<ToolCall>,
 ) -> Vec<ToolOutput> {
@@ -177,16 +206,20 @@ pub(crate) fn execute_tool_calls(
             .collect();
     }
 
-    calls
-        .into_iter()
-        .map(|call| {
-            let output = execute_tool_call(request, &call);
-            ToolOutput::new(call.id, output)
-        })
-        .collect()
+    let mut outputs = Vec::with_capacity(calls.len());
+    for call in calls {
+        let output = execute_tool_call(request, &call).await;
+        outputs.push(ToolOutput::new(call.id, output));
+    }
+    outputs
 }
 
-fn execute_tool_call(request: &ProviderRequest, call: &ToolCall) -> String {
+/// Validates and executes one call, converting every tool failure to model JSON.
+///
+/// The limit checks run before dispatch, so an oversized or unknown call never
+/// reaches a tool, and every failure path returns the same
+/// `{"ok": false, "error": ...}` shape so the model sees one vocabulary.
+async fn execute_tool_call(request: &ProviderRequest, call: &ToolCall) -> String {
     if call.id.len() > MAX_TOOL_CALL_ID_BYTES {
         return tool_error_json(format!(
             "tool call id exceeded the limit of {MAX_TOOL_CALL_ID_BYTES} bytes"
@@ -207,7 +240,7 @@ fn execute_tool_call(request: &ProviderRequest, call: &ToolCall) -> String {
         .iter()
         .find(|definition| definition.name == call.name)
     {
-        Some(definition) => (definition.run)(request, &call.arguments),
+        Some(definition) => (definition.run)(request, &call.arguments).await,
         None => Err(ToolError::new(format!(
             "unknown built-in tool `{}`",
             call.name
@@ -257,21 +290,32 @@ pub(super) fn parse_tool_path(arguments: &str) -> Result<PathBuf, ToolError> {
     Ok(path)
 }
 
-pub(super) fn resolve_tool_path(
+/// Resolves a relative tool path and rejects targets outside the working directory.
+///
+/// `parse_tool_path` only checks the lexical form. A symlink under the root
+/// can still point anywhere, so both the root and the joined path are
+/// canonicalized (following symlinks) and the result must still sit under the
+/// root. The path must exist: canonicalization of a missing target fails, and
+/// that failure is reported to the model as a tool error.
+pub(super) async fn resolve_tool_path(
     working_directory: &str,
     relative_path: &Path,
 ) -> Result<PathBuf, ToolError> {
-    let root = fs::canonicalize(working_directory).map_err(|error| {
-        ToolError::new(format!(
-            "could not resolve working directory `{working_directory}`: {error}"
-        ))
-    })?;
-    let resolved = fs::canonicalize(root.join(relative_path)).map_err(|error| {
-        ToolError::new(format!(
-            "could not resolve `{}`: {error}",
-            relative_path.display()
-        ))
-    })?;
+    let root = tokio::fs::canonicalize(working_directory)
+        .await
+        .map_err(|error| {
+            ToolError::new(format!(
+                "could not resolve working directory `{working_directory}`: {error}"
+            ))
+        })?;
+    let resolved = tokio::fs::canonicalize(root.join(relative_path))
+        .await
+        .map_err(|error| {
+            ToolError::new(format!(
+                "could not resolve `{}`: {error}",
+                relative_path.display()
+            ))
+        })?;
     if !resolved.starts_with(&root) {
         return Err(ToolError::new(
             "tool path resolved outside the working directory",

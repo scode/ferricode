@@ -7,6 +7,11 @@ repository.workspace = true
 
 [dependencies]
 serde_json = "1.0.149"
+# `rt` is not a test convenience: tokio::fs runs every operation on the
+# blocking pool, and without `rt` it compiles but panics at the first call.
+# The workspace's other crates enable it anyway, which is exactly why the
+# omission would go unnoticed until core is built on its own.
+tokio = { version = "1.52.1", default-features = false, features = ["fs", "io-util", "rt"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

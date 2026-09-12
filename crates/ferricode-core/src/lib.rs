@@ -213,7 +213,7 @@ impl Harness {
             match turn {
                 ProviderTurn::Final(summary) => return Ok(HarnessResponse::new(summary)),
                 ProviderTurn::ToolCalls { state, calls } => {
-                    let outputs = execute_tool_calls(&provider_request, calls);
+                    let outputs = execute_tool_calls(&provider_request, calls).await;
                     turn = provider.resume(state, &outputs).await?;
                 }
             }
