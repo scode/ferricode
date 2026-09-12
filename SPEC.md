@@ -42,7 +42,7 @@ directory listing and UTF-8 file reading under the request working directory. Pr
 through provider-specific wire formats, but they must not own the filesystem safety policy.
 
 The first provider is `ferricode-openai-codex`. Its public provider name is `openai-codex`. It uses Codex-compatible
-ChatGPT OAuth, not the OpenAI Platform API key path. For now it hardcodes `gpt-5.4` and medium reasoning effort.
+ChatGPT OAuth, not the OpenAI Platform API key path. For now it hardcodes `gpt-6-astra` and medium reasoning effort.
 
 # Authentication
 
