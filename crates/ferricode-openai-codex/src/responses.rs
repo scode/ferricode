@@ -26,12 +26,17 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 const CODEX_BACKEND_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-/// Model sent on every Codex responses request. `gpt-5.4` was rejected by the
-/// backend on 2026-09-12 with "not supported when using Codex with a ChatGPT
-/// account"; `gpt-6-astra` was verified live through a tool turn the same day.
-/// SPEC.md names this model too and must stay in sync.
-const MODEL: &str = "gpt-6-astra";
-const REASONING_EFFORT: &str = "medium";
+/// Model sent on every Codex responses request.
+///
+/// The backend only accepts some model names for ChatGPT-account logins:
+/// `gpt-5.4` was rejected on 2026-09-12 with "not supported when using Codex
+/// with a ChatGPT account". `gpt-5.6-luna` at high effort was verified live
+/// through two tool turns on 2026-09-13. SPEC.md names this model too and must
+/// stay in sync.
+const MODEL: &str = "gpt-5.6-luna";
+/// Reasoning effort sent alongside `MODEL`. SPEC.md names this value too and
+/// must stay in sync.
+const REASONING_EFFORT: &str = "high";
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCodexProvider {
@@ -266,8 +271,11 @@ fn turn_item_types(turn: &ProviderTurn) -> Vec<String> {
 /// Removes a top-level output item `id` before replaying it as Responses input.
 ///
 /// The API rejects that item id as input. This behavior comes from the earlier
-/// state-based implementation; whether reasoning items survive this path has
-/// not been verified live because the backend returned none during the check.
+/// state-based implementation. On 2026-09-13 `gpt-5.6-luna` at high effort
+/// returned a `reasoning` item alongside a function call, and the backend
+/// accepted it replayed this way on both continuation requests. Nothing checks
+/// whether the model actually uses the replayed reasoning; the request carries
+/// no `include` for encrypted reasoning content.
 fn strip_provider_item_ids(mut item: Value) -> Value {
     if let Some(map) = item.as_object_mut() {
         map.remove("id");
@@ -587,8 +595,8 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer access")
         );
-        assert!(requests[0].contains(r#""model":"gpt-6-astra""#));
-        assert!(requests[0].contains(r#""effort":"medium""#));
+        assert!(requests[0].contains(r#""model":"gpt-5.6-luna""#));
+        assert!(requests[0].contains(r#""effort":"high""#));
     }
 
     #[tokio::test]
